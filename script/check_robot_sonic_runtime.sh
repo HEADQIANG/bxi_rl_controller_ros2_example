@@ -12,8 +12,10 @@ section() { echo; echo "== $* =="; }
 source_if_exists() {
   local file="$1"
   if [[ -f "${file}" ]]; then
+    set +u
     # shellcheck disable=SC1090
     source "${file}"
+    set -u
     ok "sourced ${file}"
   else
     warn "missing ${file}"

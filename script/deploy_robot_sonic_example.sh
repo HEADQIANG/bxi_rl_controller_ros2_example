@@ -14,6 +14,18 @@ else
   SUDO=(sudo)
 fi
 
+source_setup() {
+  local file="$1"
+  if [[ ! -f "${file}" ]]; then
+    echo "[deploy] ERROR: missing ${file}"
+    exit 2
+  fi
+  set +u
+  # shellcheck disable=SC1090
+  source "${file}"
+  set -u
+}
+
 echo "[deploy] repo=${REPO_URL}"
 echo "[deploy] branch=${BRANCH}"
 echo "[deploy] src=${SRC_DIR}"
@@ -36,8 +48,8 @@ fi
 
 echo "[deploy] commit=$(git rev-parse --short HEAD)"
 
-source /opt/ros/humble/setup.bash
-source /opt/bxi/bxi_ros2_pkg/setup.bash
+source_setup /opt/ros/humble/setup.bash
+source_setup /opt/bxi/bxi_ros2_pkg/setup.bash
 
 rm -rf build log "${BUILD_INSTALL}"
 
@@ -60,7 +72,7 @@ fi
 
 "${SUDO[@]}" cp -a "${BUILD_INSTALL}/." "${OPT_PREFIX}/"
 
-source "${OPT_PREFIX}/setup.bash"
+source_setup "${OPT_PREFIX}/setup.bash"
 
 ros2 pkg prefix bxi_example_py_elf3
 ros2 pkg prefix remote_controller
