@@ -22,6 +22,24 @@ START_FAILURE_SIGKILL_GRACE = 1.0
 STOP_POLL_INTERVAL = 0.05
 
 
+def default_pico_python_executable() -> str:
+    """Pick the Python interpreter that has the robot-side PICO dependencies."""
+    env_python = os.environ.get("SONIC_PICO_PYTHON")
+    if env_python:
+        return env_python
+
+    for candidate in (
+        "/home/bxi/bxi_rl_controller_ros2_example-main/.venv_teleop/bin/python",
+        "/home/bxi/bxi_rl_controller_ros2_example/.venv_teleop/bin/python",
+        "/home/bxi/bxi_ws/bxi_rl_controller_ros2_example/.venv_teleop/bin/python",
+        "/opt/bxi/bxi_rl_controller_ros2_example/.venv_teleop/bin/python",
+    ):
+        if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+
+    return sys.executable
+
+
 def state_requests_sonic(info: Any, target: str = "sonic_teleop") -> bool:
     """Return the desired runtime state from a state-machine snapshot."""
     if not isinstance(info, dict):
@@ -352,7 +370,7 @@ class SonicPicoRuntimeSupervisor(Node):
         self.declare_parameter("restart_delay", 3.0)
         self.declare_parameter(
             "python_executable",
-            os.environ.get("SONIC_PICO_PYTHON", sys.executable),
+            default_pico_python_executable(),
         )
         self.topic = str(self.get_parameter("state_machine_info_topic").value)
         self.target_state = str(self.get_parameter("target_state").value)

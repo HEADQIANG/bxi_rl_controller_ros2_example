@@ -29,6 +29,60 @@ not supported by this source-only dependency subset. The supervisor normally
 uses its own Python interpreter; set `SONIC_PICO_PYTHON` to the deployment
 virtualenv interpreter when the PICO dependencies live in a separate venv. The
 provided Sim2Sim script detects `<repo>/.venv_teleop/bin/python` automatically.
+On the robot, the hardware launch also auto-detects the known deployment venv
+locations, including:
+
+```text
+/home/bxi/bxi_rl_controller_ros2_example-main/.venv_teleop/bin/python
+/home/bxi/bxi_rl_controller_ros2_example/.venv_teleop/bin/python
+/home/bxi/bxi_ws/bxi_rl_controller_ros2_example/.venv_teleop/bin/python
+/opt/bxi/bxi_rl_controller_ros2_example/.venv_teleop/bin/python
+```
+
+You can still override it explicitly with either `SONIC_PICO_PYTHON` or the
+launch argument `sonic_pico_python:=...`.
+
+## Robot deployment
+
+The tablet app should not be modified for this branch. Deploy the compiled ROS
+packages by overwriting the existing example install under `/opt/bxi`, after
+taking a backup.
+
+On each robot:
+
+```bash
+cd ~
+
+if [ ! -d "$HOME/bxi_rl_controller_ros2_example/.git" ]; then
+  git clone -b feature/sonic-elf3-runtime --single-branch \
+    https://github.com/Cloudpilot-Liftingwater/bxi_rl_controller_ros2_example.git \
+    "$HOME/bxi_rl_controller_ros2_example"
+fi
+
+export REPO_URL=https://github.com/Cloudpilot-Liftingwater/bxi_rl_controller_ros2_example.git
+export BRANCH=feature/sonic-elf3-runtime
+bash "$HOME/bxi_rl_controller_ros2_example/script/deploy_robot_sonic_example.sh"
+```
+
+Then verify the install and PICO dependencies:
+
+```bash
+bash "$HOME/bxi_rl_controller_ros2_example/script/check_robot_sonic_runtime.sh"
+```
+
+For a direct terminal test on the robot, use two root terminals:
+
+```bash
+# T1
+bash "$HOME/bxi_rl_controller_ros2_example/script/run_robot_sonic_hw.sh"
+
+# T2
+bash "$HOME/bxi_rl_controller_ros2_example/script/run_robot_sonic_controller.sh"
+```
+
+Keyboard state flow is `!` (PD brake), `1` (normal), then `6` (SONIC). After
+SONIC starts and PICO body data is available, press `ABXY` to calibrate/start
+and `A+X` to switch to POSE/live.
 
 ## Sim2Sim
 

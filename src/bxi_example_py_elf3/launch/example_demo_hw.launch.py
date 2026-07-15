@@ -4,7 +4,10 @@ import fcntl
 import atexit
 from ament_index_python.packages import get_package_share_path
 from launch import LaunchDescription
+from launch.actions import DeclareLaunchArgument
+from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 LOCK_FILE = "/tmp/bxi_example_hw.lock"
 _lock_fd = None
@@ -77,6 +80,22 @@ def _acquire_lock():
     _lock_fd = fd
     atexit.register(_release_lock)
 
+
+def _default_sonic_pico_python():
+    env_python = os.environ.get("SONIC_PICO_PYTHON")
+    if env_python:
+        return env_python
+    for candidate in (
+        "/home/bxi/bxi_rl_controller_ros2_example-main/.venv_teleop/bin/python",
+        "/home/bxi/bxi_rl_controller_ros2_example/.venv_teleop/bin/python",
+        "/home/bxi/bxi_ws/bxi_rl_controller_ros2_example/.venv_teleop/bin/python",
+        "/opt/bxi/bxi_rl_controller_ros2_example/.venv_teleop/bin/python",
+    ):
+        if os.path.exists(candidate) and os.access(candidate, os.X_OK):
+            return candidate
+    return sys.executable
+
+
 def generate_launch_description():
     _acquire_lock()
 
@@ -88,6 +107,22 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
+            DeclareLaunchArgument(
+                "sonic_pico_auto_start",
+                default_value="true",
+                description=(
+                    "Start manager+bridge automatically when the state machine "
+                    "enters sonic_teleop."
+                ),
+            ),
+            DeclareLaunchArgument(
+                "sonic_pico_python",
+                default_value=_default_sonic_pico_python(),
+                description=(
+                    "Python interpreter that contains XRoboToolkit/torch/zmq "
+                    "for the robot-side PICO runtime."
+                ),
+            ),
             Node(
                 package="hardware_elf3",
                 executable="hardware_elf3",
@@ -124,7 +159,13 @@ def generate_launch_description():
                 parameters=[
                     {"state_machine_info_topic": state_machine_info_topic},
                     {"target_state": "sonic_teleop"},
-                    {"enabled": True},
+                    {
+                        "enabled": ParameterValue(
+                            LaunchConfiguration("sonic_pico_auto_start"),
+                            value_type=bool,
+                        )
+                    },
+                    {"python_executable": LaunchConfiguration("sonic_pico_python")},
                 ],
                 emulate_tty=True,
             ),
