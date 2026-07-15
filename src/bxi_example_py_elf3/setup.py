@@ -1,4 +1,4 @@
-from setuptools import setup
+from setuptools import find_packages, setup
 import os
 
 package_name = 'bxi_example_py_elf3'
@@ -52,16 +52,19 @@ def get_config_files():
 setup(
     name=package_name,
     version='0.0.0',
-    packages=[package_name,
-              f'{package_name}.inference',
-              f'{package_name}.utils',
-              ],
+    packages=find_packages(),
+    package_data={
+        f'{package_name}.sonic_pico.vendor.gear_sonic': [
+            'data/human/*.pkl',
+            'data/robot_model/model_data/g1/*.urdf',
+        ],
+    },
     data_files=[
         ('share/ament_index/resource_index/packages',['resource/' + package_name]),
         ('share/' + package_name, ['package.xml']),
     ] + get_data_files() + get_launch_files() + get_config_files(),
     install_requires=['setuptools'],
-    zip_safe=True,
+    zip_safe=False,
     maintainer='liufq',
     maintainer_email='popsay@163.com',
     description='TODO: Package description',
@@ -71,6 +74,8 @@ setup(
         'console_scripts': [
             'bxi_example_py_elf3_mjlab = bxi_example_py_elf3.bxi_example_mjlab:main',
             'bxi_example_py_elf3_demo = bxi_example_py_elf3.bxi_example_demo:main',
+            'sonic_pico_bridge = bxi_example_py_elf3.sonic_pico.pico_pose_to_smpl_ref_bridge:main',
+            'sonic_pico_manager_legacy = bxi_example_py_elf3.sonic_pico.pico_manager_legacy:main',
         ],
     },
 )

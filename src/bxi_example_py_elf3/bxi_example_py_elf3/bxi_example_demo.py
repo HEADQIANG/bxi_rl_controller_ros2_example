@@ -25,6 +25,7 @@ from ament_index_python.packages import get_package_share_directory
 from bxi_example_py_elf3.inference.beyondmimic import *
 from bxi_example_py_elf3.inference.normal import *
 from bxi_example_py_elf3.inference.amp import *
+from bxi_example_py_elf3.inference.sonic import SonicTeleopPolicy
 from bxi_example_py_elf3.utils.hot_reload import HotReloadMixin
 from bxi_example_py_elf3.utils.state_machine import (
     RobotStateMachine,
@@ -226,6 +227,21 @@ class BxiExample(HotReloadMixin, Node):
         self.declare_parameter("/hot_reload", False)
         self.hot_reload_enabled = bool(self.get_parameter("/hot_reload").value)
 
+        self.declare_parameter("/startup_release_delay", 1.0)
+        self.startup_release_delay = float(
+            self.get_parameter("/startup_release_delay").value
+        )
+
+        self.declare_parameter("/startup_release_allowed_states", "")
+        allowed_states = (
+            self.get_parameter("/startup_release_allowed_states")
+            .get_parameter_value()
+            .string_value
+        )
+        self.startup_release_allowed_states = {
+            state.strip() for state in allowed_states.split(",") if state.strip()
+        }
+
     def load_models(self):
         data_dir = os.path.join(
             get_package_share_directory("bxi_example_py_elf3"),
@@ -237,6 +253,15 @@ class BxiExample(HotReloadMixin, Node):
             path = os.path.join(data_dir, file_name)
             model_file_paths.append(path)
             return path
+
+        def tracked_file(path: str) -> str:
+            model_file_paths.append(path)
+            return path
+
+        def model_file_or_env(env_name: str, file_name: str) -> str:
+            return tracked_file(
+                os.environ.get(env_name, os.path.join(data_dir, file_name))
+            )
 
         self.normal: HumanoidGaitPolicyLiteIsaaclab = HumanoidGaitPolicyLiteIsaaclab(
             model_file("isaaclab_model/amp_terrain.onnx")
@@ -282,6 +307,18 @@ class BxiExample(HotReloadMixin, Node):
         )
         self.withoutarm: HumanoidGaitPolicyLiteIsaaclab = HumanoidGaitPolicyLiteIsaaclab(
             model_file("isaaclab_model/withoutarm.onnx")
+        )
+        sonic_model_path = model_file_or_env(
+            "BXI_SONIC_MODEL_ONNX",
+            "sonic_model/elf3_step28800_smpl/model_step_028800_smpl.onnx",
+        )
+        sonic_stream_reference_path = model_file_or_env(
+            "BXI_SONIC_STREAM_REFERENCE_NPZ",
+            "sonic_reference/elf3_step28800_idle_left_001_A019/stream_reference.npz",
+        )
+        self.sonic_teleop: SonicTeleopPolicy = SonicTeleopPolicy(
+            model_onnx_path=sonic_model_path,
+            stream_reference_npz=sonic_stream_reference_path,
         )
         self.model_file_paths: tuple[str, ...] = tuple(model_file_paths)
         self.pd_pos: np.ndarray = self.normal.default_dof_pos
@@ -354,16 +391,29 @@ class BxiExample(HotReloadMixin, Node):
             self.robot_reset(1, False)  # first reset
             print("robot reset 1!")
             self.step = 1
-            return
-        elif self.step == 1 and self.loop_count >= (1.0 / self.dt):  # 延迟2s
-            self.robot_reset(2, True)  # first reset
-            print("robot reset 2!")
             self.loop_count = 0
-            self.step = 2
-            self.reset_inference_timeout_monitor()
             return
 
-        if self.step == 2:
+        if self.step == 1 and self.startup_release_delay >= 0.0:
+            release_ready = self.loop_count >= int(self.startup_release_delay / self.dt)
+            state_name = self.state_name_by_id.get(self.state, str(self.state))
+            state_allowed = (
+                not self.startup_release_allowed_states
+                or state_name in self.startup_release_allowed_states
+            )
+            if release_ready and state_allowed:
+                self.robot_reset(2, True)  # release suspension
+                print(f"robot reset 2! release from state={state_name}")
+                self.loop_count = 0
+                self.step = 2
+                self.reset_inference_timeout_monitor()
+            elif release_ready and self.loop_count % int(max(1.0 / self.dt, 1)) == 0:
+                print(
+                    "startup release waiting for allowed state: "
+                    f"current={state_name}, allowed={sorted(self.startup_release_allowed_states)}"
+                )
+
+        if self.step >= 1:
             self.check_hot_reload(self.dt)
 
             with self.lock_in:
@@ -511,11 +561,11 @@ class BxiExample(HotReloadMixin, Node):
                 msg.yawdot_des,
             )
             events = self.remote_event_adapter.extract_events(
-                msg, sync_only=self.step < 2
+                msg, sync_only=self.step < 1
             )
             self.pending_remote_events.extend(events)
 
-        if self.step < 2:
+        if self.step < 1:
             return
 
     def imu_callback(self, msg):

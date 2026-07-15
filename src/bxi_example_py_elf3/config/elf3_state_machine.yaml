@@ -52,6 +52,9 @@ remote_events:
   hello_event:
     slot: btn_10
     value: 6
+  sonic_teleop_event:
+    slot: btn_10
+    value: 7
 
 #预设的一些过度方式
 transition_profiles:
@@ -141,6 +144,9 @@ states:
           transition: soft_switch
         normal_run_event:
           to: normal_run
+          transition: soft_switch
+        sonic_teleop_event:
+          to: sonic_teleop
           transition: soft_switch
         dance_event:
           to: dance
@@ -241,6 +247,32 @@ states:
         toggle_dance_pause_event:
           action: toggle_dance_pause
 
+  sonic_teleop:
+    manifest:
+      label: SONIC遥操
+      index: 14
+      group: Advanced
+      icon: sports_esports
+      confirm: true
+      confirm_message: 请先进入正常行走模式，并完成PICO对齐后再进入SONIC遥操
+    behavior: SonicTeleopState
+    transitions:
+      on_event:
+        normal_event:
+          to: normal
+          transition: soft_switch
+        zero_torque_event: zero_torque
+        pd_brake_event:
+          to: pd_brake
+          transition:
+            base: first_frame_switch
+            enter_duration: 1.0
+        recover_event:
+          to: recover
+          transition: soft_switch
+        toggle_dance_pause_event:
+          action: reset_sonic_alignment
+
   recover:
     manifest:
       label: 起身
@@ -269,6 +301,9 @@ states:
         normal_event:
           to: normal
           transition: soft_switch
+        sonic_teleop_event:
+          to: sonic_teleop
+          transition: soft_switch
 
   normal_run:
     manifest:
@@ -284,6 +319,9 @@ states:
       on_event:
         normal_event:
           to: normal
+          transition: soft_switch
+        sonic_teleop_event:
+          to: sonic_teleop
           transition: soft_switch
 
   back_flip:

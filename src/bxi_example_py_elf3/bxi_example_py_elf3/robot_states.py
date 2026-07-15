@@ -4,8 +4,12 @@ import pickle
 from typing import TYPE_CHECKING, Any, Optional
 
 import numpy as np
+import communication.msg as bxiMsg
+import std_msgs.msg
+from rclpy.qos import QoSProfile
 
 from ament_index_python.packages import get_package_share_path
+from bxi_example_py_elf3.utils.bxi_motor import BxiMotor, JointControl as BxiJointControl
 from bxi_example_py_elf3.utils.robot_state_base import MotorFrame, RobotControlState
 from bxi_example_py_elf3.utils.state_machine import StateBehavior, TransitionProfile
 from bxi_example_py_elf3.utils.tfs import quaternion_to_euler_array
@@ -57,6 +61,134 @@ class NormalState(RobotControlState):
         frame = self.get_motor_frame(ctx, dt, False)
         if frame is not None:
             ctx.set_motor_target(*frame)
+
+
+class SonicTeleopState(RobotControlState):
+    def on_bind(self, ctx: BxiExample) -> None:
+        super().on_bind(ctx)
+        self.left_trigger = 0.0
+        self.right_trigger = 0.0
+        self.gripper_enabled = os.environ.get(
+            "BXI_SONIC_GRIPPER_ENABLE", "0"
+        ).lower() not in ("0", "false", "no", "off")
+        self.gripper_left_bus = int(os.environ.get("BXI_SONIC_GRIPPER_LEFT_BUS", "5"))
+        self.gripper_right_bus = int(os.environ.get("BXI_SONIC_GRIPPER_RIGHT_BUS", "6"))
+        self.gripper_can_id = int(os.environ.get("BXI_SONIC_GRIPPER_CAN_ID", "1"))
+        self.gripper_kp = float(os.environ.get("BXI_SONIC_GRIPPER_KP", "20"))
+        self.gripper_kd = float(os.environ.get("BXI_SONIC_GRIPPER_KD", "1"))
+        self.gripper_msg_type = getattr(
+            bxiMsg, "CANFDPacket", getattr(bxiMsg, "CanfdPacket", None)
+        )
+
+        if not self.gripper_enabled:
+            return
+        if self.gripper_msg_type is None:
+            self.gripper_enabled = False
+            print(
+                "SONIC gripper disabled: communication.msg.CANFDPacket is unavailable"
+            )
+            return
+
+        qos = QoSProfile(depth=1)
+        self.left_trigger_sub = ctx.create_subscription(
+            std_msgs.msg.Float32,
+            "pico/left_trigger",
+            self.left_trigger_callback,
+            qos,
+        )
+        self.right_trigger_sub = ctx.create_subscription(
+            std_msgs.msg.Float32,
+            "pico/right_trigger",
+            self.right_trigger_callback,
+            qos,
+        )
+        self.gripper_control_pub = ctx.create_publisher(
+            self.gripper_msg_type,
+            "canfd_packet/tx",
+            QoSProfile(depth=100),
+        )
+
+    def left_trigger_callback(self, msg: std_msgs.msg.Float32) -> None:
+        self.left_trigger = float(msg.data)
+
+    def right_trigger_callback(self, msg: std_msgs.msg.Float32) -> None:
+        self.right_trigger = float(msg.data)
+
+    def _publish_gripper_command(self, bus: int, trigger: float) -> None:
+        if not self.gripper_enabled or not hasattr(self, "gripper_control_pub"):
+            return
+        trigger = float(np.clip(trigger, 0.0, 1.0))
+        self.gripper_control_pub.publish(
+            BxiMotor.build_motor_packet(
+                bus,
+                self.gripper_can_id,
+                BxiMotor.enter_motor_mode(),
+            )
+        )
+        self.gripper_control_pub.publish(
+            BxiMotor.build_motor_packet(
+                bus,
+                self.gripper_can_id,
+                BxiMotor.pack_cmd(
+                    joint=BxiJointControl(
+                        p_des=float((1.0 - trigger) * 0.5 - 0.1),
+                        v_des=0.0,
+                        kp=self.gripper_kp,
+                        kd=self.gripper_kd,
+                        t_ff=0.0,
+                    ),
+                    p_range=(-12.5, 12.5),
+                    v_range=(-45.0, 45.0),
+                    t_range=(-40.0, 40.0),
+                    kp_range=(0.0, 500.0),
+                    kd_range=(0.0, 5.0),
+                ),
+            )
+        )
+
+    def _update_gripper(self) -> None:
+        self._publish_gripper_command(self.gripper_left_bus, self.left_trigger)
+        self._publish_gripper_command(self.gripper_right_bus, self.right_trigger)
+
+    def on_prepare_enter(
+        self,
+        ctx: BxiExample,
+        from_state: StateBehavior[BxiExample],
+        transition: TransitionProfile,
+    ) -> None:
+        super().on_prepare_enter(ctx, from_state, transition)
+        ctx.sonic_teleop.reset()
+        ctx.preheat_model(ctx.sonic_teleop)
+
+    def get_first_frame(self, ctx: BxiExample) -> Optional[MotorFrame]:
+        return self._motor_frame(
+            ctx.sonic_teleop.target_dof_pos,
+            ctx.sonic_teleop.kps,
+            ctx.sonic_teleop.kds,
+        )
+
+    def get_motor_frame(
+        self, ctx: BxiExample, dt: float, on_translation: bool
+    ) -> Optional[MotorFrame]:
+        qpos = ctx.sonic_teleop.inference_step(
+            ctx.current_q,
+            ctx.current_dq,
+            ctx.current_quat_wxyz,
+            ctx.current_omega,
+        )
+        return self._motor_frame(qpos, ctx.sonic_teleop.kps, ctx.sonic_teleop.kds)
+
+    def on_update(self, ctx: BxiExample, dt: float) -> None:
+        frame = self.get_motor_frame(ctx, dt, False)
+        if frame is not None:
+            ctx.set_motor_target(*frame)
+        self._update_gripper()
+
+    def on_action(self, ctx: BxiExample, action_name: str) -> bool:
+        if action_name != "reset_sonic_alignment":
+            return False
+        ctx.sonic_teleop.reset_yaw_alignment()
+        return True
 
 
 class ZeroTorqueState(RobotControlState):

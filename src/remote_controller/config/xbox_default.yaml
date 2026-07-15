@@ -49,10 +49,11 @@ sources:
       keyboard.dance: {from: keyboard.key, key: "3"}
       keyboard.amp_run: {from: keyboard.key, key: "4"}
       keyboard.normal_run: {from: keyboard.key, key: "5"}
-      keyboard.back_flip: {from: keyboard.key, key: "6"}
+      keyboard.back_flip: {from: keyboard.key, key: "0"}
       keyboard.forward_flip: {from: keyboard.key, key: "7"}
       keyboard.applause: {from: keyboard.key, key: "8"}
       keyboard.hello: {from: keyboard.key, key: "9"}
+      keyboard.sonic_teleop: {from: keyboard.key, key: "6"}
 
 #预设的一些，输入曲线
 curves:
@@ -137,6 +138,7 @@ controls:
   keyboard.forward_flip_event: {type: bool, source: keyboard.forward_flip}
   keyboard.applause_event: {type: bool, source: keyboard.applause}
   keyboard.hello_event: {type: bool, source: keyboard.hello}
+  keyboard.sonic_teleop_event: {type: bool, source: keyboard.sonic_teleop}
 
 #将统一的controls映射到输出
 outputs:
@@ -242,6 +244,12 @@ outputs:
         any:
           - [trigger.right_event, button.a_event]
           - [keyboard.hello_event]
+
+    - output: btn_10=7
+      when:
+        any:
+          - [trigger.right_event, button.x_event]
+          - [keyboard.sonic_teleop_event]
 
 #自定义命令
 system:
