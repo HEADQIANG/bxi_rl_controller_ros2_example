@@ -81,10 +81,22 @@ else
 fi
 
 section "Ports"
-if ss -lntup 2>/dev/null | grep -E ':(5556|5557|60061)\b'; then
-  ok "SONIC/PICO ports listed above"
+if ss -lntup 2>/dev/null | grep -E ':(5556|5557|60061|8081)\b'; then
+  ok "SONIC/PICO-related ports listed above"
 else
-  warn "no 5556/5557/60061 listeners; this is expected before SONIC/PICO starts"
+  warn "no 5556/5557/60061/8081 listeners; this is expected before SONIC/PICO starts"
+fi
+
+section "PICO external port 8081"
+if port_8081="$(ss -lntup 2>/dev/null | grep -E ':8081\b' || true)" && [[ -n "${port_8081}" ]]; then
+  echo "${port_8081}"
+  if grep -q 'RoboticsService' <<<"${port_8081}"; then
+    ok "8081 is owned by RoboticsService"
+  else
+    fail "8081 is occupied by a non-RoboticsService process; PICO cannot change ports and will hit the wrong service"
+  fi
+else
+  ok "8081 is free before PICO runtime starts"
 fi
 
 section "Result"

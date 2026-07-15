@@ -33,7 +33,17 @@ echo "[INFO] PICO Python: ${PYTHON_BIN}"
 import importlib
 import sys
 
-required = ["numpy", "scipy", "zmq", "msgpack", "torch", "xrobotoolkit_sdk"]
+required = [
+    "numpy",
+    "scipy",
+    "zmq",
+    "msgpack",
+    "torch",
+    "xrobotoolkit_sdk",
+    "eigenpy",
+    "hppfcl",
+    "pinocchio",
+]
 failed = False
 
 for name in required:
@@ -41,6 +51,14 @@ for name in required:
         module = importlib.import_module(name)
         version = getattr(module, "__version__", "unknown")
         print(f"[OK] import {name}: {version}")
+        if name == "numpy":
+            major = int(str(version).split(".", 1)[0])
+            if major >= 2:
+                failed = True
+                print(
+                    "[FAIL] numpy must be <2 for the bundled pin/eigenpy wheels; "
+                    f"found {version}"
+                )
     except Exception as exc:
         failed = True
         print(f"[FAIL] import {name}: {exc!r}")
