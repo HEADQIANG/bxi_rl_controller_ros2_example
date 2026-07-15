@@ -33,7 +33,7 @@ echo "[INFO] PICO Python: ${PYTHON_BIN}"
 import importlib
 import sys
 
-required = ["numpy", "zmq", "msgpack", "torch", "xrobotoolkit_sdk"]
+required = ["numpy", "scipy", "zmq", "msgpack", "torch", "xrobotoolkit_sdk"]
 failed = False
 
 for name in required:
