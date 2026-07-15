@@ -185,10 +185,15 @@ class BxiExample(HotReloadMixin, Node):
         # 定时器初始化
         self.step = 0
         self.dt = 0.02  # loop @50Hz
-        self.inference_period = self.dt
-        self.inference_timeout_tolerance = 0.005
-        self.last_inference_frame_time = None
-        self.inference_timeout_count = 0
+        self.control_period = self.dt
+        self.control_rate_tolerance = 0.005
+        self.control_rate_report_period = 1.0
+        self.last_control_frame_time = None
+        self.control_rate_report_start_time = None
+        self.control_rate_frame_count = 0
+        self.control_rate_late_count = 0
+        self.control_rate_delay_sum = 0.0
+        self.control_rate_delay_max = 0.0
         self.state_machine_info_elapsed = 0.0
         self.timer = self.create_timer(
             self.dt, self.timer_callback, callback_group=self.timer_callback_group_1
@@ -406,7 +411,10 @@ class BxiExample(HotReloadMixin, Node):
                 print(f"robot reset 2! release from state={state_name}")
                 self.loop_count = 0
                 self.step = 2
-                self.reset_inference_timeout_monitor()
+                self.reset_control_rate_monitor()
+                # Match the official startup sequence: release first, then begin
+                # publishing control targets on the following timer callback.
+                return
             elif release_ready and self.loop_count % int(max(1.0 / self.dt, 1)) == 0:
                 print(
                     "startup release waiting for allowed state: "
@@ -414,7 +422,8 @@ class BxiExample(HotReloadMixin, Node):
                 )
 
         if self.step >= 1:
-            self.check_hot_reload(self.dt)
+            if self.step >= 2:
+                self.check_hot_reload(self.dt)
 
             with self.lock_in:
                 self.current_q = self.qpos.copy()
@@ -431,17 +440,14 @@ class BxiExample(HotReloadMixin, Node):
             transition_active = self.state_machine.update(self.dt, events)
             self.state = self.state_machine.current_state_id
 
-            if not transition_active:
+            if self.step < 2:
+                self.motor_target = None
+            elif not transition_active:
                 self.state_machine.update_current_state(self.dt)
                 self.state = self.state_machine.current_state_id
 
-            if self.motor_target is not None:
-                qpos, kp, kd = self.motor_target
-                self.pos_last = qpos
-                self.kp_last = kp
-                self.kd_last = kd
-                self.check_inference_frame_timeout()
-                self.send_to_motor(qpos, kp, kd)
+            if self.step >= 2:
+                self.publish_motor_target_if_released()
 
         self.loop_count += 1
         self.publish_state_machine_info_if_due(events)
@@ -603,34 +609,68 @@ class BxiExample(HotReloadMixin, Node):
     def hold_last_motor_target(self):
         self.set_motor_target(self.pos_last, self.kp_last, self.kd_last)
 
-    def reset_inference_timeout_monitor(self):
-        self.last_inference_frame_time = None
-        self.inference_timeout_count = 0
+    def publish_motor_target_if_released(self) -> bool:
+        """Publish a pending target only after the simulator suspension is released."""
+        if self.step < 2 or self.motor_target is None:
+            return False
 
-    def check_inference_frame_timeout(self):
+        qpos, kp, kd = self.motor_target
+        self.pos_last = qpos
+        self.kp_last = kp
+        self.kd_last = kd
+        self.check_control_frame_rate()
+        self.send_to_motor(qpos, kp, kd)
+        return True
+
+    def reset_control_rate_monitor(self):
+        self.last_control_frame_time = None
+        self.control_rate_report_start_time = None
+        self.control_rate_frame_count = 0
+        self.control_rate_late_count = 0
+        self.control_rate_delay_sum = 0.0
+        self.control_rate_delay_max = 0.0
+
+    def check_control_frame_rate(self):
         now = time.perf_counter()
-        last = self.last_inference_frame_time
-        self.last_inference_frame_time = now
-        if last is None or self.inference_period <= 0.0:
+        last = self.last_control_frame_time
+        self.last_control_frame_time = now
+        if last is None or self.control_period <= 0.0:
+            self.control_rate_report_start_time = now
             return
 
         frame_delay = now - last
-        timeout_threshold = self.inference_period + self.inference_timeout_tolerance
-        if frame_delay <= timeout_threshold:
+        self.control_rate_frame_count += 1
+        self.control_rate_delay_sum += frame_delay
+        self.control_rate_delay_max = max(self.control_rate_delay_max, frame_delay)
+        timeout_threshold = self.control_period + self.control_rate_tolerance
+        if frame_delay > timeout_threshold:
+            self.control_rate_late_count += 1
+
+        report_start = self.control_rate_report_start_time
+        if report_start is None:
+            self.control_rate_report_start_time = now
             return
 
-        self.inference_timeout_count += 1
+        elapsed = now - report_start
+        if elapsed < self.control_rate_report_period:
+            return
+
+        frame_count = self.control_rate_frame_count
+        mean_delay = self.control_rate_delay_sum / max(frame_count, 1)
         state_name = self.state_name_by_id.get(self.state, str(self.state))
         print(
-            "[INFERENCE TIMEOUT] "
+            "[CONTROL RATE] "
             f"state={state_name}, "
-            f"delay={frame_delay * 1000.0:.2f}ms, "
-            f"limit={self.inference_period * 1000.0:.2f}ms "
-            f"({1.0 / self.inference_period:.1f}Hz), "
-            f"tolerance={self.inference_timeout_tolerance * 1000.0:.2f}ms, "
-            f"over={(frame_delay - self.inference_period) * 1000.0:.2f}ms, "
-            f"count={self.inference_timeout_count}"
+            f"hz={frame_count / max(elapsed, 1e-9):.1f}, "
+            f"mean={mean_delay * 1000.0:.2f}ms, "
+            f"max={self.control_rate_delay_max * 1000.0:.2f}ms, "
+            f"late={self.control_rate_late_count}/{frame_count}"
         )
+        self.control_rate_report_start_time = now
+        self.control_rate_frame_count = 0
+        self.control_rate_late_count = 0
+        self.control_rate_delay_sum = 0.0
+        self.control_rate_delay_max = 0.0
 
     def request_state(
         self, state_name, trigger="code", transition="instant", delay=0.0

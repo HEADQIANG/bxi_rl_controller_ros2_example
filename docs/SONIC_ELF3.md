@@ -10,7 +10,7 @@ unchanged. The SONIC controller still publishes the official 29-joint
 The source branch is not the internal offline deployment archive. It excludes
 XRT binaries, offline wheels, build/install/log output, internal reports and
 experimental gripper CAD. `bxi_example_bms` is optional battery telemetry and
-is not required by T1, T2 or T3.
+is not required by the controller, Sim2Sim or the PICO runtime.
 
 ## Dependencies
 
@@ -24,13 +24,23 @@ colcon build --packages-select bxi_example_py_elf3 remote_controller
 Real PICO operation also requires the robot vendor's
 `xrobotoolkit_sdk` binding and `/opt/apps/roboticsservice/RoboticsServiceProcess`.
 Those files are deliberately not stored in GitHub. PyVista/VTK and the G1 CAD
-meshes are not needed by the default headless T3 path; `PICO_ENABLE_VIS=1` is
-not supported by this source-only dependency subset.
+meshes are not needed by the default headless PICO path; `PICO_ENABLE_VIS=1` is
+not supported by this source-only dependency subset. The supervisor normally
+uses its own Python interpreter; set `SONIC_PICO_PYTHON` to the deployment
+virtualenv interpreter when the PICO dependencies live in a separate venv. The
+provided Sim2Sim script detects `<repo>/.venv_teleop/bin/python` automatically.
 
 ## Sim2Sim
 
-Open three terminals from the repository root after sourcing ROS and the
-workspace install.
+Build once from the repository root:
+
+```bash
+source /opt/ros/humble/setup.bash
+colcon build --packages-select bxi_example_py_elf3 remote_controller
+```
+
+Then open two terminals. The launch file now owns a lightweight PICO runtime
+supervisor, so a separate T3 terminal is not needed in the normal flow.
 
 T1 — MuJoCo and the BXI controller:
 
@@ -44,24 +54,84 @@ T2 — keyboard/remote controller:
 bash script/run_sonic_sim2sim_controller.sh
 ```
 
-T3 — PICO manager and PICO-to-SMPL bridge:
-
-```bash
-bash script/run_sonic_pico_sources.sh
-```
-
 Keyboard state flow is `!` (PD brake), `1` (normal), then `6` (SONIC).
 Back-flip moves from keyboard key `6` to `0`; its gamepad mapping is unchanged.
 The SONIC gamepad mapping is `RT + X`.
 
-T3 owns both child process groups and escalates shutdown from SIGINT to SIGTERM
-and SIGKILL if necessary. It uses port 5556 for PICO pose, port 5557 for
-`smpl_ref`, and the external XRT service normally uses port 60061.
+When the state-machine transition targets `sonic_teleop`, or SONIC is already
+the current state, the supervisor starts exactly one PICO manager and one
+PICO-to-SMPL bridge. Leaving SONIC stops both child process groups. A missing
+or malformed state-machine heartbeat also fails closed and stops them. Shutdown
+escalates from SIGINT to SIGTERM and SIGKILL if needed. The manager uses port
+5556 for PICO pose, the bridge uses port 5557 for `smpl_ref`, and the external
+XRT service normally uses port 60061.
+
+Do not run `script/run_sonic_pico_sources.sh` alongside the automatic
+supervisor because both instances would contend for the same ports. That script
+is retained for diagnostics; disable launch auto-start with
+`sonic_pico_auto_start:=false` before using it manually.
+
+### Sim2Sim verification
+
+1. Start T1 first. While the state is still `zero_torque`, the suspended robot
+   receives no controller motor command during reset step 1. Start T2 and select
+   `!` and `1`; state events are accepted while suspended, but actuator targets
+   remain blocked. The simulator releases only after reaching `normal`. Select
+   `6` after release to enter SONIC.
+2. Confirm the T1 log reports that the SONIC PICO manager and bridge are being
+   started. With no PICO body data, SONIC must continue ONNX inference from the
+   fixed `idle_left` window and report `idle_reference`; it must not wait in a
+   non-policy default pose.
+3. For a live-input test, connect XRobotToolkit and wait for fresh body data.
+   Hold the intended calibration pose and press all four PICO buttons
+   (`A+B+X+Y`, abbreviated `ABXY`) once. The manager must only leave `OFF` after
+   it has a body sample and the three-point calibration handshake succeeds.
+4. Press `A+X` once to change `PLANNER` to `POSE`. The bridge requires three
+   consecutive finite POSE messages with `calibration_ready=true` and a
+   strictly advancing frame index. After its initial window fills (normally
+   about 0.2 s at 50 Hz), SONIC reports `live_reference` and follows PICO.
+5. Stop the PICO data stream, or switch the manager out of POSE. Live
+   publication stops after the freshness timeout (0.2 s by default), and SONIC
+   blends back to the fixed idle reference instead of replaying stale motion.
+   The transient status is `live_stale_to_idle`, followed by `idle_reference`.
+6. Switch from SONIC back to `normal`. The manager and bridge must stop while
+   the launch-owned supervisor remains available for the next SONIC entry.
+
+To inspect the state seen by the supervisor:
+
+```bash
+ros2 topic echo --once /simulation/state_machine_info std_msgs/msg/String
+```
+
+After leaving SONIC, check that no manager/bridge child or listening socket was
+left behind:
+
+```bash
+pgrep -af 'pico_manager_legacy|pico_manager_thread_server|pico_pose_to_smpl_ref_bridge'
+ss -ltnp | grep -E ':(5556|5557|60061)\b'
+```
+
+Both commands should print nothing created by this run. If
+`RoboticsServiceProcess` or port 60061 was already managed externally before
+the test, compare with the pre-test baseline instead. Finally press Ctrl+C in
+T1 and confirm that `sonic_pico_runtime_supervisor` is also gone:
+
+```bash
+pgrep -af 'sonic_pico_runtime_supervisor|pico_manager_legacy|pico_pose_to_smpl_ref_bridge'
+```
 
 ## Runtime policy
 
-- SONIC requires a fresh live `smpl_ref` by default. Until one arrives it holds
-  the policy default pose and reports `waiting_for_live_smpl_ref`.
+- Entering SONIC automatically requests the PICO runtime. Before the source is
+  ready, SONIC keeps running the policy against a fixed, calm ten-frame window
+  from the clean `idle_left` reference; the reference cursor does not advance.
+- Live `smpl_ref` is accepted only when the bridge marks it
+  `source_ready=true`. That requires a successful ABXY readiness handshake,
+  POSE mode, progressing frame indices, finite tensors and consecutive fresh
+  messages. Idle-to-live and live-to-idle target changes are blended.
+- When live input becomes stale, SONIC discards the old live packet and returns
+  to `idle_left`. Re-entering or resetting SONIC cannot reuse a packet from the
+  previous session.
 - SONIC intentionally does not use the common approximately 60-degree
   roll/pitch transition to `zero_torque`; other states retain that protection.
 - Gripper CAN control is present as an optional integration and is disabled by
@@ -69,6 +139,16 @@ and SIGKILL if necessary. It uses port 5556 for PICO pose, port 5557 for
   `BXI_SONIC_GRIPPER_ENABLE=1` and `PICO_ENABLE_ROS_BUTTONS=1`.
 - The PICO manager retains the validated G1 legacy FK calibration. The ELF3 FK
   helper is included for A/B evaluation but is not the default calibration.
+
+### Calibration boundary
+
+`CALIB_FULL`/ABXY currently calibrates the manager's three-point VR tracking
+and also serves as an explicit operator-readiness handshake. It does **not**
+numerically calibrate or remap the raw SMPL tensors consumed by SONIC in POSE
+mode (`smpl_joints`, `body_quat_w`, and `joint_pos`). Therefore
+`calibration_ready=true` means that the three-point calibration step succeeded;
+it must not be interpreted as proof that the full SONIC body-reference tensor
+has been calibrated to ELF3.
 
 ## Model and references
 
@@ -81,12 +161,18 @@ data/sonic_reference/elf3_step28800_idle_left_001_A019/stream_reference.npz
 
 They can be overridden with `BXI_SONIC_MODEL_ONNX` and
 `BXI_SONIC_STREAM_REFERENCE_NPZ`. See `THIRD_PARTY_NOTICES.md` for model
-license, attribution, cleanup provenance and SHA256.
+license, attribution, cleanup provenance and SHA256. The installed idle file is
+also the fallback source used before PICO readiness and after a live-stream
+timeout. The default calm window starts at frame 3509; use
+`BXI_SONIC_IDLE_FRAME_START` to change it after a Sim2Sim A/B. Source changes
+use a 0.4 second smoothstep blend by default, configurable with
+`BXI_SONIC_SOURCE_BLEND_SECONDS`.
 
 ## Validation status
 
-The local Sim2Sim chain, clean source build/install, cleaned ONNX
-inference-equivalence check, and T3 SIGINT cleanup while waiting for body data
-have passed. That cleanup left no manager/bridge/XRT process or
-5556/5557/60061 listener behind. Real-robot cleanup during normal POSE still
-requires validation before declaring the true-hardware deployment closed.
+The earlier local Sim2Sim chain, clean source build/install, cleaned ONNX
+inference-equivalence check, and manual T3 SIGINT cleanup while waiting for body
+data passed. The automatic state-driven lifecycle and idle/live readiness path
+must pass the verification above before real-robot deployment. Real-robot
+cleanup during normal POSE still requires validation before declaring the
+true-hardware deployment closed.

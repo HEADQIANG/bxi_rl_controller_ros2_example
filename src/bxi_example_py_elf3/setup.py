@@ -76,6 +76,7 @@ setup(
             'bxi_example_py_elf3_demo = bxi_example_py_elf3.bxi_example_demo:main',
             'sonic_pico_bridge = bxi_example_py_elf3.sonic_pico.pico_pose_to_smpl_ref_bridge:main',
             'sonic_pico_manager_legacy = bxi_example_py_elf3.sonic_pico.pico_manager_legacy:main',
+            'sonic_pico_runtime_supervisor = bxi_example_py_elf3.sonic_pico.runtime_supervisor:main',
         ],
     },
 )

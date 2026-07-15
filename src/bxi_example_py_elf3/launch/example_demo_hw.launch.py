@@ -84,6 +84,7 @@ def generate_launch_description():
         get_package_share_path("bxi_example_py_elf3"),
         "config/elf3_state_machine.yaml",
     )
+    state_machine_info_topic = "hardware/state_machine_info"
 
     return LaunchDescription(
         [
@@ -109,10 +110,23 @@ def generate_launch_description():
                 parameters=[
                     {"/topic_prefix": "hardware/"},
                     {"/state_machine_config": state_machine_config},
+                    {"/state_machine_info_topic": state_machine_info_topic},
                     {"/hot_reload": False},
                 ],
                 emulate_tty=True,
                 arguments=[("__log_level:=debug")],
+            ),
+            Node(
+                package="bxi_example_py_elf3",
+                executable="sonic_pico_runtime_supervisor",
+                name="sonic_pico_runtime_supervisor",
+                output="screen",
+                parameters=[
+                    {"state_machine_info_topic": state_machine_info_topic},
+                    {"target_state": "sonic_teleop"},
+                    {"enabled": True},
+                ],
+                emulate_tty=True,
             ),
         ]
     )

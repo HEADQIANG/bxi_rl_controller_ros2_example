@@ -1113,6 +1113,7 @@ class ThreePointPose:
         self._calibration_rwrist_offset: np.ndarray | None = None
         self._calibration_lwrist_rot_offset: sRot | None = None  # orientation offset
         self._calibration_rwrist_rot_offset: sRot | None = None
+        self._calibration_complete = False
         # Override robot q for FK during recalibration (e.g. measured joints for VR 3PT)
         self._override_robot_q: np.ndarray | None = None
 
@@ -1124,7 +1125,7 @@ class ThreePointPose:
     @property
     def is_calibrated(self) -> bool:
         """Check if calibration has been captured."""
-        return self._calibration_neck_quat_inv is not None
+        return self._calibration_complete
 
     def process_smpl_pose(
         self,
@@ -1173,6 +1174,7 @@ class ThreePointPose:
     def calibrate_now(self, body_poses_np: np.ndarray) -> bool:
         """Calibrate using current SMPL frame against FK of all-zero body joints.
         Operator should be in zero-reference pose when calling this."""
+        self._clear_calibration()
         try:
             vr_3pt_pose_raw = _process_3pt_pose(body_poses_np)
             self._override_robot_q = np.zeros(29, dtype=np.float64)
@@ -1180,6 +1182,7 @@ class ThreePointPose:
             print(f"[{self.log_prefix}] Calibration completed (zero-pose reference)")
             return True
         except Exception as e:
+            self._clear_calibration()
             print(f"[{self.log_prefix}] Calibration failed: {e}")
             import traceback
 
@@ -1244,6 +1247,7 @@ class ThreePointPose:
 
         self._calibration_pending = False
         self._override_robot_q = None
+        self._calibration_complete = True
 
         # Log summary
         source = "override q" if g1_lwrist_pos.any() else "default/zero"
@@ -1304,7 +1308,9 @@ class ThreePointPose:
         self._calibration_rwrist_offset = None
         self._calibration_lwrist_rot_offset = None
         self._calibration_rwrist_rot_offset = None
+        self._calibration_pending = False
         self._override_robot_q = None
+        self._calibration_complete = False
 
     def reset(self) -> None:
         """Reset calibration. Next process_smpl_pose() call will recalibrate."""
@@ -1626,6 +1632,10 @@ class PoseStreamer:
                 "toggle_data_abort": np.array([toggle_data_abort], dtype=bool),
                 "heading_increment": np.array(
                     [self.yaw_accumulator.yaw_angle_change()], dtype=np.float32
+                ),
+                "stream_mode": np.array([StreamMode.POSE.value], dtype=np.int32),
+                "calibration_ready": np.array(
+                    [self.three_point.is_calibrated], dtype=bool
                 ),
             }
 
@@ -2111,14 +2121,18 @@ def run_pico_manager(
             new_mode = current_mode
             if current_mode == StreamMode.OFF:
                 if start_combo and not prev_start_combo:
-                    new_mode = StreamMode.PLANNER
                     # Calibrate VR 3pt tracking NOW: operator should be in zero-ref pose.
                     # Uses the current Pico SMPL frame + FK of all-zero body joints.
                     sample = reader.get_latest()
-                    if sample is not None:
-                        three_point.calibrate_now(sample["body_poses_np"])
+                    if sample is not None and three_point.calibrate_now(
+                        sample["body_poses_np"]
+                    ):
+                        new_mode = StreamMode.PLANNER
                     else:
-                        print("[Manager] WARNING: No SMPL data available for calibration")
+                        print(
+                            "[Manager] Calibration not ready; staying OFF. "
+                            "Hold zero pose and press A+B+X+Y again."
+                        )
 
             elif current_mode == StreamMode.PLANNER:
                 # Chain 2: POSE <--(ax)--> PLANNER <--(left_axis_click)--> VR_3PT
@@ -2235,6 +2249,9 @@ def run_pico_manager(
                 pack_pose_message(
                     {
                         "stream_mode": np.array([current_mode.value], dtype=np.int32),
+                        "calibration_ready": np.array(
+                            [three_point.is_calibrated], dtype=bool
+                        ),
                         "toggle_data_collection": np.array([toggle_dc], dtype=bool),
                         "toggle_data_abort": np.array([toggle_da], dtype=bool),
                     },

@@ -9,6 +9,7 @@ from launch import LaunchDescription
 from launch.actions import DeclareLaunchArgument
 from launch.substitutions import LaunchConfiguration
 from launch_ros.actions import Node
+from launch_ros.parameter_descriptions import ParameterValue
 
 
 def generate_launch_description():
@@ -49,6 +50,13 @@ def generate_launch_description():
                 default_value=state_machine_config,
                 description="BXI state machine config with sonic_teleop state.",
             ),
+            DeclareLaunchArgument(
+                "sonic_pico_auto_start",
+                default_value="true",
+                description=(
+                    "Start manager+bridge when state_machine_info enters sonic_teleop."
+                ),
+            ),
             Node(
                 package="mujoco",
                 executable="simulation",
@@ -74,6 +82,23 @@ def generate_launch_description():
                     {
                         "/startup_release_allowed_states": LaunchConfiguration(
                             "startup_release_allowed_states"
+                        )
+                    },
+                ],
+                emulate_tty=True,
+            ),
+            Node(
+                package="bxi_example_py_elf3",
+                executable="sonic_pico_runtime_supervisor",
+                name="sonic_pico_runtime_supervisor",
+                output="screen",
+                parameters=[
+                    {"state_machine_info_topic": "simulation/state_machine_info"},
+                    {"target_state": "sonic_teleop"},
+                    {
+                        "enabled": ParameterValue(
+                            LaunchConfiguration("sonic_pico_auto_start"),
+                            value_type=bool,
                         )
                     },
                 ],

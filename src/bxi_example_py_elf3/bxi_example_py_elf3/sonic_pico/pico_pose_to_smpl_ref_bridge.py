@@ -62,6 +62,8 @@ WINDOW = 10
 HISTORY_FRAMES = 5
 MAX_GAP_FRAMES = 200
 DEFAULT_RATE_HZ = 50.0
+POSE_STREAM_MODE = 1
+READY_CONSECUTIVE_MESSAGES = 3
 
 
 PICO_BUTTON_FIELDS = (
@@ -167,6 +169,92 @@ class MergeResult:
     did_catchup_reset: bool = False
     frame_offset_adjustment: int = 0
     frame_step: int = 1
+
+
+class PicoSourceReadinessGate:
+    """Require calibrated POSE metadata and progressing, finite raw frames."""
+
+    def __init__(self, required_consecutive: int = READY_CONSECUTIVE_MESSAGES):
+        self.required_consecutive = max(1, int(required_consecutive))
+        self.reset()
+
+    def reset(self) -> None:
+        self.streak = 0
+        self.last_frame_index: int | None = None
+        self.last_message_mono: float | None = None
+        self.last_ready_mono: float | None = None
+
+    def observe(
+        self,
+        fields: dict[str, np.ndarray],
+        now_mono: float,
+        stale_seconds: float,
+    ) -> bool:
+        if (
+            self.last_message_mono is not None
+            and now_mono - self.last_message_mono > stale_seconds
+        ):
+            self.reset()
+        self.last_message_mono = now_mono
+
+        frame_index: int | None = None
+        try:
+            mode = int(np.asarray(fields["stream_mode"]).reshape(-1)[-1])
+            calibrated = bool(
+                np.asarray(fields["calibration_ready"]).reshape(-1)[-1]
+            )
+            frame_index = int(np.asarray(fields["frame_index"]).reshape(-1)[-1])
+            finite = all(
+                np.asarray(fields[name]).size > 0
+                and np.isfinite(np.asarray(fields[name])).all()
+                for name in ("smpl_joints", "body_quat_w", "joint_pos")
+            )
+        except (KeyError, TypeError, ValueError, IndexError):
+            mode, calibrated, finite = -1, False, False
+
+        source_valid = mode == POSE_STREAM_MODE and calibrated and finite
+        if (
+            source_valid
+            and frame_index is not None
+            and self.last_frame_index is not None
+            and frame_index < self.last_frame_index
+        ):
+            # PICO restarts its frame counter when a new POSE session starts.
+            # Treat the first lower-index packet as frame one of that session;
+            # otherwise the gate would wait for the counter to overtake the
+            # previous session before live references could become ready again.
+            self.streak = 0
+            self.last_frame_index = None
+            self.last_ready_mono = None
+
+        progressing = (
+            frame_index is not None
+            and (
+                self.last_frame_index is None
+                or frame_index > self.last_frame_index
+            )
+        )
+        if frame_index is not None and (
+            self.last_frame_index is None or frame_index > self.last_frame_index
+        ):
+            self.last_frame_index = frame_index
+        if source_valid and progressing:
+            self.streak += 1
+        else:
+            self.streak = 0
+            self.last_ready_mono = None
+        ready = self.streak >= self.required_consecutive
+        if ready:
+            self.last_ready_mono = now_mono
+        return ready
+
+    def is_fresh(self, now_mono: float, stale_seconds: float) -> bool:
+        return (
+            self.streak >= self.required_consecutive
+            and self.last_message_mono is not None
+            and self.last_ready_mono is not None
+            and now_mono - self.last_ready_mono <= stale_seconds
+        )
 
 
 def _decode_packed_message(msg: bytes, topic: str) -> dict[str, np.ndarray] | None:
@@ -435,6 +523,29 @@ class StreamedSmplRefMerger:
         }
 
 
+def _build_live_smpl_ref_if_ready(
+    source_gate: PicoSourceReadinessGate,
+    merger: StreamedSmplRefMerger,
+    now_mono: float,
+    stale_seconds: float,
+) -> dict[str, np.ndarray] | None:
+    """Build one live output only while the calibrated POSE source is fresh."""
+    if not source_gate.is_fresh(now_mono, stale_seconds):
+        if merger.timesteps:
+            merger.reset()
+        return None
+
+    smpl_ref = merger.build_smpl_ref()
+    if smpl_ref is None:
+        return None
+    smpl_ref["source_ready"] = np.array([True], dtype=bool)
+    smpl_ref["source_stream_mode"] = np.array(
+        [POSE_STREAM_MODE], dtype=np.int32
+    )
+    smpl_ref["source_calibration_ready"] = np.array([True], dtype=bool)
+    return smpl_ref
+
+
 def main() -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--pico-host", default="127.0.0.1")
@@ -462,8 +573,8 @@ def main() -> int:
     parser.add_argument(
         "--stale-warning-seconds",
         type=float,
-        default=0.5,
-        help="warn when no fresh PICO pose chunk has arrived for this many seconds",
+        default=0.2,
+        help="stop live output when raw calibrated POSE is stale for this many seconds",
     )
     args = parser.parse_args()
 
@@ -507,6 +618,7 @@ def main() -> int:
         max_gap_frames=args.max_gap_frames,
         catch_up_enabled=not args.disable_catch_up,
     )
+    source_gate = PicoSourceReadinessGate()
     period = 1.0 / args.rate
     next_tick = time.monotonic()
     last_log = 0.0
@@ -531,23 +643,40 @@ def main() -> int:
                     fields = _decode_packed_message(msg, args.pico_topic)
                     if fields is not None:
                         button_pub.publish(fields)
-                        pending_fields = fields
-                        last_received_mono = time.monotonic()
+                        received_mono = time.monotonic()
+                        if source_gate.observe(
+                            fields,
+                            received_mono,
+                            args.stale_warning_seconds,
+                        ):
+                            pending_fields = fields
+                        else:
+                            pending_fields = None
+                        last_received_mono = received_mono
                         stale_was_reported = False
                         received += 1
 
             if time.monotonic() < next_tick:
                 continue
 
-            if pending_fields is not None:
+            source_fresh = source_gate.is_fresh(
+                time.monotonic(), args.stale_warning_seconds
+            )
+            if pending_fields is not None and source_fresh:
                 try:
                     merger.merge(_parse_incoming_chunk(pending_fields, args.wrist_source))
                 except Exception as exc:
                     skipped += 1
+                    source_gate.reset()
                     print(f"[pico->smpl_ref] skipped invalid PICO pose: {exc}", flush=True)
                 pending_fields = None
 
-            smpl_ref = merger.build_smpl_ref()
+            smpl_ref = _build_live_smpl_ref_if_ready(
+                source_gate,
+                merger,
+                time.monotonic(),
+                args.stale_warning_seconds,
+            )
             if smpl_ref is not None:
                 pub.send(pack_pose_message(smpl_ref, topic=args.out_topic, version=4))
                 sent += 1
@@ -562,25 +691,27 @@ def main() -> int:
             if next_tick < tick_now - period:
                 next_tick = tick_now + period
 
+            if (
+                last_received_mono is not None
+                and input_age > args.stale_warning_seconds
+                and not stale_was_reported
+            ):
+                print(
+                    "[pico->smpl_ref] WARN PICO pose input stale; "
+                    f"age_ms={input_age * 1000.0:.0f} received={received}. "
+                    "Live smpl_ref publication is stopped; policy uses idle_left.",
+                    flush=True,
+                )
+                stale_was_reported = True
+
             if now - last_log >= args.log_every:
                 if smpl_ref is None:
                     print(
-                        "[pico->smpl_ref] waiting for buffered PICO frames "
+                        "[pico->smpl_ref] waiting for calibrated, fresh POSE frames "
                         f"received={received} skipped={skipped}",
                         flush=True,
                     )
                 else:
-                    stale_text = ""
-                    if input_age > args.stale_warning_seconds:
-                        stale_text = f" STALE_INPUT age_ms={input_age * 1000.0:.0f}"
-                        if not stale_was_reported:
-                            print(
-                                "[pico->smpl_ref] WARN PICO pose input stale; "
-                                f"age_ms={input_age * 1000.0:.0f} received={received}. "
-                                "Continuing to publish the last clamped smpl_ref window.",
-                                flush=True,
-                            )
-                            stale_was_reported = True
                     print(
                         "[pico->smpl_ref] sent "
                         f"{sent} received={received} skipped={skipped} "
@@ -590,8 +721,7 @@ def main() -> int:
                         f"T={merger.timesteps} window_start={merger.stream_window_start} "
                         f"catchups={merger.catchup_count} "
                         f"term1={smpl_ref['term1_local'].shape} "
-                        f"root={smpl_ref['root_quat'].shape} wrist={smpl_ref['wrist'].shape}"
-                        f"{stale_text}",
+                        f"root={smpl_ref['root_quat'].shape} wrist={smpl_ref['wrist'].shape}",
                         flush=True,
                     )
                 last_log = now

@@ -254,7 +254,7 @@ states:
       group: Advanced
       icon: sports_esports
       confirm: true
-      confirm_message: 请先进入正常行走模式，并完成PICO对齐后再进入SONIC遥操
+      confirm_message: 进入后先保持idle_left站立；PICO按ABXY完成校准，再按A+X切入实时POSE
     behavior: SonicTeleopState
     transitions:
       on_event:

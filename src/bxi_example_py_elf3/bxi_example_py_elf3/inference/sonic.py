@@ -33,6 +33,7 @@ SMPL_TOKENIZER_DIM = 840
 PROPRIOCEPTION_DIM = 930
 MODEL_INPUT_DIM = SMPL_TOKENIZER_DIM + PROPRIOCEPTION_DIM
 ACTION_CLIP = 20.0
+DEFAULT_IDLE_FRAME_START = 3509
 
 SMPL_JOINTS_START = 0
 SMPL_ROOT_ORI_START = 720
@@ -400,6 +401,8 @@ def _as_window(arr: np.ndarray, width: int, name: str) -> np.ndarray:
         arr = arr.reshape(arr.shape[0], -1)
     if arr.shape[1] != width:
         raise ValueError(f"{name} has shape {arr.shape}; expected (*,{width})")
+    if arr.shape[0] == 0:
+        raise ValueError(f"{name} is empty")
     if arr.shape[0] >= WINDOW:
         return np.ascontiguousarray(arr[:WINDOW], dtype=np.float32)
     return np.ascontiguousarray(
@@ -455,6 +458,12 @@ class SonicTeleopPolicy:
             else os.environ.get("BXI_SONIC_YAW_BIAS_RAD", "1.57079632679")
         )
         self.live_ref_timeout_s = float(os.environ.get("BXI_SONIC_LIVE_REF_TIMEOUT_S", "0.5"))
+        self.idle_frame_start = int(
+            os.environ.get("BXI_SONIC_IDLE_FRAME_START", str(DEFAULT_IDLE_FRAME_START))
+        )
+        self.source_blend_duration_s = max(
+            0.0, float(os.environ.get("BXI_SONIC_SOURCE_BLEND_SECONDS", "0.4"))
+        )
 
         self.default_dof_pos = DEFAULT_DOF_POS.copy()
         self.target_dof_pos = DEFAULT_DOF_POS.copy()
@@ -471,14 +480,20 @@ class SonicTeleopPolicy:
         self.action_history = np.zeros((WINDOW, NUM_JOINTS), dtype=np.float32)
         self.gravity_history = np.zeros((WINDOW, 3), dtype=np.float32)
 
-        self.motion_cursor = 0
+        self.motion_cursor = self.idle_frame_start
         self.yaw_aligned = False
         self.yaw_offset = 0.0
         self.latest_live_ref: Optional[SmplReferenceFrame] = None
         self.latest_live_ref_time = 0.0
         self.live_sequence = 0
+        self.reference_source: Optional[str] = None
+        self.source_blend_from = self.default_dof_pos.copy()
+        self.source_blend_started_at = 0.0
+        self.source_blend_active = False
+        self.source_transition_from: Optional[str] = None
         self.policy_active = False
         self.last_status = "not_started"
+        self._reported_status: Optional[str] = None
 
         self._load_stream_reference()
         self._init_onnx()
@@ -556,6 +571,13 @@ class SonicTeleopPolicy:
             raise ValueError("root_quat shape does not match term1_local")
         if self.ref_wrist.shape != (self.ref_term1.shape[0], 6):
             raise ValueError("wrist shape does not match term1_local")
+        if self.ref_term1.shape[0] < WINDOW:
+            raise ValueError(
+                f"reference only has {self.ref_term1.shape[0]} frames; expected at least {WINDOW}"
+            )
+        self.idle_frame_start = int(
+            np.clip(self.idle_frame_start, 0, self.ref_term1.shape[0] - WINDOW)
+        )
 
     def reset(self) -> None:
         self.last_action.fill(0.0)
@@ -564,16 +586,36 @@ class SonicTeleopPolicy:
         self.joint_vel_history.fill(0.0)
         self.action_history.fill(0.0)
         self.gravity_history.fill(0.0)
-        self.motion_cursor = 0
+        self.motion_cursor = self.idle_frame_start
         self.yaw_aligned = False
         self.yaw_offset = 0.0
+        self.latest_live_ref = None
+        self.latest_live_ref_time = 0.0
+        self.live_sequence = 0
+        self.reference_source = None
+        self.source_blend_from = self.default_dof_pos.copy()
+        self.source_blend_started_at = 0.0
+        self.source_blend_active = False
+        self.source_transition_from = None
         self.policy_active = False
         self.last_status = "reset"
+        self._reported_status = None
         self.target_dof_pos = self.default_dof_pos.copy()
+        self._drain_reference_socket()
 
     def reset_yaw_alignment(self) -> None:
         self.yaw_aligned = False
         self.yaw_offset = 0.0
+
+    def _drain_reference_socket(self) -> None:
+        """Discard packets queued before a SONIC reset/re-entry."""
+        if self.zmq_socket is None:
+            return
+        while True:
+            try:
+                self.zmq_socket.recv(flags=zmq.NOBLOCK)
+            except zmq.Again:
+                break
 
     def poll_reference(self) -> Optional[SmplReferenceFrame]:
         if self.zmq_socket is None:
@@ -582,35 +624,71 @@ class SonicTeleopPolicy:
             events = dict(self.zmq_poller.poll(timeout=0))
             if self.zmq_socket not in events:
                 break
-            msg = self.zmq_socket.recv(flags=zmq.NOBLOCK)
-            fields = _decode_packed_message(msg, self.smpl_ref_zmq_topic)
-            if not fields:
+            try:
+                msg = self.zmq_socket.recv(flags=zmq.NOBLOCK)
+                fields = _decode_packed_message(msg, self.smpl_ref_zmq_topic)
+                if not fields:
+                    continue
+                frame = self._frame_from_fields(fields)
+            except (
+                IndexError,
+                KeyError,
+                TypeError,
+                UnicodeDecodeError,
+                ValueError,
+                json.JSONDecodeError,
+                zmq.Again,
+            ):
                 continue
-            frame = self._frame_from_fields(fields)
             self.latest_live_ref = frame
             self.latest_live_ref_time = time.monotonic()
         return self.latest_live_ref
 
     def _frame_from_fields(self, fields: dict[str, np.ndarray]) -> SmplReferenceFrame:
-        self.live_sequence += 1
+        source_ready = fields.get("source_ready")
+        if source_ready is None or not bool(np.asarray(source_ready).reshape(-1)[-1]):
+            raise ValueError("smpl_ref source is not ready")
+        stream_mode = fields.get("source_stream_mode")
+        if stream_mode is not None and int(np.asarray(stream_mode).reshape(-1)[-1]) != 1:
+            raise ValueError("smpl_ref source is not in POSE mode")
+        calibration_ready = fields.get("source_calibration_ready")
+        if calibration_ready is not None and not bool(
+            np.asarray(calibration_ready).reshape(-1)[-1]
+        ):
+            raise ValueError("smpl_ref source is not calibrated")
+
         frame_index = fields.get("frame_index")
         if frame_index is None or frame_index.size == 0:
             index = -1
         else:
             index = int(np.asarray(frame_index).reshape(-1)[-1])
         anchor = fields.get("anchor_quat")
-        return SmplReferenceFrame(
+        frame = SmplReferenceFrame(
             term1_local=_as_window(fields["term1_local"], 72, "term1_local"),
             root_quat=_as_window(fields["root_quat"], 4, "root_quat"),
             wrist=_as_window(fields["wrist"], 6, "wrist"),
             anchor_quat=_as_window(anchor, 4, "anchor_quat") if anchor is not None else None,
             frame_index=index,
-            sequence=self.live_sequence,
+            sequence=self.live_sequence + 1,
         )
+        arrays = [frame.term1_local, frame.root_quat, frame.wrist]
+        if frame.anchor_quat is not None:
+            arrays.append(frame.anchor_quat)
+        if not all(np.isfinite(array).all() for array in arrays):
+            raise ValueError("smpl_ref contains non-finite values")
+        if np.any(np.linalg.norm(frame.root_quat, axis=1) <= 1.0e-6):
+            raise ValueError("smpl_ref contains an invalid root quaternion")
+        if frame.anchor_quat is not None and np.any(
+            np.linalg.norm(frame.anchor_quat, axis=1) <= 1.0e-6
+        ):
+            raise ValueError("smpl_ref contains an invalid anchor quaternion")
+        self.live_sequence += 1
+        return frame
 
     def _offline_frame(self) -> SmplReferenceFrame:
         t = self.ref_term1.shape[0]
-        idx = np.minimum(np.arange(self.motion_cursor, self.motion_cursor + WINDOW), t - 1)
+        start = int(np.clip(self.idle_frame_start, 0, t - WINDOW))
+        idx = np.arange(start, start + WINDOW)
         anchor = self.ref_anchor_quat[idx] if self.ref_anchor_quat is not None else None
         return SmplReferenceFrame(
             term1_local=np.ascontiguousarray(self.ref_term1[idx], dtype=np.float32),
@@ -621,13 +699,45 @@ class SonicTeleopPolicy:
             sequence=0,
         )
 
-    def _active_reference(self) -> Optional[SmplReferenceFrame]:
+    def _active_reference(self) -> tuple[SmplReferenceFrame, str, float]:
         live = self.poll_reference()
-        if live is not None and time.monotonic() - self.latest_live_ref_time <= self.live_ref_timeout_s:
-            return live
-        if self.require_live_reference:
-            return None
-        return self._offline_frame()
+        now_mono = time.monotonic()
+        if (
+            live is not None
+            and now_mono - self.latest_live_ref_time <= self.live_ref_timeout_s
+        ):
+            return live, "live", now_mono
+        if live is not None:
+            self.latest_live_ref = None
+            self.latest_live_ref_time = 0.0
+        return self._offline_frame(), "idle", now_mono
+
+    def _begin_source_transition(self, source: str, now_mono: float) -> None:
+        if source == self.reference_source:
+            return
+        self.source_transition_from = self.reference_source
+        self.reference_source = source
+        self.reset_yaw_alignment()
+        self.source_blend_from = self.target_dof_pos.copy()
+        self.source_blend_started_at = now_mono
+        self.source_blend_active = self.source_blend_duration_s > 0.0
+
+    def _blend_source_target(
+        self, candidate: np.ndarray, now_mono: float
+    ) -> np.ndarray:
+        if not self.source_blend_active:
+            return candidate
+        progress = np.clip(
+            (now_mono - self.source_blend_started_at) / self.source_blend_duration_s,
+            0.0,
+            1.0,
+        )
+        alpha = float(progress * progress * (3.0 - 2.0 * progress))
+        blended = (1.0 - alpha) * self.source_blend_from + alpha * candidate
+        if progress >= 1.0:
+            self.source_blend_active = False
+            self.source_transition_from = None
+        return np.asarray(blended, dtype=np.float32)
 
     def _update_history(self, q: np.ndarray, dq: np.ndarray, quat_wxyz: np.ndarray, omega: np.ndarray) -> np.ndarray:
         anchor = _waist_z_quat_from_torso_wxyz(quat_wxyz, q[0], q[1], q[2])
@@ -708,13 +818,8 @@ class SonicTeleopPolicy:
         quat_wxyz = np.asarray(quat_wxyz, dtype=np.float64).reshape(4)
         omega = np.asarray(omega, dtype=np.float32).reshape(3)
 
-        frame = self._active_reference()
-        if frame is None:
-            self._update_history(q, dq, quat_wxyz, omega)
-            self.target_dof_pos = self.default_dof_pos.copy()
-            self.policy_active = False
-            self.last_status = "waiting_for_live_smpl_ref"
-            return self.target_dof_pos
+        frame, source, now_mono = self._active_reference()
+        self._begin_source_transition(source, now_mono)
 
         model_input = self._build_model_input(frame, q, dq, quat_wxyz, omega)
         np.copyto(self.input_buffer, model_input)
@@ -722,10 +827,19 @@ class SonicTeleopPolicy:
             [self.output_info.name], {self.input_info.name: self.input_buffer}
         )[0].reshape(-1)
         action = np.clip(raw_action, -ACTION_CLIP, ACTION_CLIP).astype(np.float32)
-        self.last_action = action
-        self.target_dof_pos = self.default_dof_pos + action * self.action_scale
+        candidate = self.default_dof_pos + action * self.action_scale
+        self.target_dof_pos = self._blend_source_target(candidate, now_mono)
+        self.last_action = (
+            (self.target_dof_pos - self.default_dof_pos) / self.action_scale
+        ).astype(np.float32)
         self.policy_active = True
-        self.last_status = "policy"
-        if not self.require_live_reference:
-            self.motion_cursor = min(self.motion_cursor + 1, self.ref_term1.shape[0] - 1)
+        if source == "live":
+            self.last_status = "live_reference"
+        elif self.source_blend_active and self.source_transition_from == "live":
+            self.last_status = "live_stale_to_idle"
+        else:
+            self.last_status = "idle_reference"
+        if self.last_status != self._reported_status:
+            print(f"[SONIC] reference status: {self.last_status}", flush=True)
+            self._reported_status = self.last_status
         return self.target_dof_pos
