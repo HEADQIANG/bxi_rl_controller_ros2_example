@@ -256,3 +256,39 @@ def test_bridge_output_env_prefers_bxi_names_with_legacy_fallback(
     assert _option(bridge_command, "--out-port") == expected[1]
     assert _option(bridge_command, "--out-topic") == expected[2]
     assert kwargs["start_new_session"] is True
+
+
+def test_pico_manager_defaults_to_cpu(monkeypatch):
+    processes = [FakeProcess(pid=501), FakeProcess(pid=502)]
+    popen_calls = []
+
+    def fake_popen(command, **kwargs):
+        popen_calls.append((command, kwargs))
+        return processes[len(popen_calls) - 1]
+
+    monkeypatch.delenv("SONIC_PICO_USE_CUDA", raising=False)
+    monkeypatch.setattr(runtime_supervisor.subprocess, "Popen", fake_popen)
+    pipeline = PicoPipeline(FakeLogger(), "python3")
+
+    pipeline.start()
+
+    manager_command = popen_calls[0][0]
+    assert "--cuda" not in manager_command
+
+
+def test_pico_manager_cuda_is_explicit_opt_in(monkeypatch):
+    processes = [FakeProcess(pid=601), FakeProcess(pid=602)]
+    popen_calls = []
+
+    def fake_popen(command, **kwargs):
+        popen_calls.append((command, kwargs))
+        return processes[len(popen_calls) - 1]
+
+    monkeypatch.setenv("SONIC_PICO_USE_CUDA", "1")
+    monkeypatch.setattr(runtime_supervisor.subprocess, "Popen", fake_popen)
+    pipeline = PicoPipeline(FakeLogger(), "python3")
+
+    pipeline.start()
+
+    manager_command = popen_calls[0][0]
+    assert "--cuda" in manager_command

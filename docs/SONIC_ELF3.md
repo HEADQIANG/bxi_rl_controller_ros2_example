@@ -42,6 +42,10 @@ locations, including:
 You can still override it explicitly with either `SONIC_PICO_PYTHON` or the
 launch argument `sonic_pico_python:=...`.
 
+The robot-side PICO manager defaults to CPU. Set `SONIC_PICO_USE_CUDA=1` only
+on machines that actually have a usable CUDA device; ELF3 onboard computers are
+expected to run this path without CUDA.
+
 ## Robot deployment
 
 The tablet app should not be modified for this branch. Deploy the compiled ROS

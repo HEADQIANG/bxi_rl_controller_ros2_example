@@ -21,6 +21,7 @@ SMPL_REF_ZMQ_TOPIC="${SMPL_REF_ZMQ_TOPIC:-smpl_ref}"
 WRIST_SOURCE="${WRIST_SOURCE:-pico_g1_legacy}"
 BRIDGE_LOG_EVERY="${BRIDGE_LOG_EVERY:-1}"
 PICO_ENABLE_ROS_BUTTONS="${PICO_ENABLE_ROS_BUTTONS:-0}"
+SONIC_PICO_USE_CUDA="${SONIC_PICO_USE_CUDA:-0}"
 PYTHON_BIN="${PYTHON_BIN:-python3}"
 
 STOP_INT_TIMEOUT="${SONIC_PICO_STOP_INT_TIMEOUT:-3}"
@@ -33,9 +34,11 @@ if [[ -z "${manager_arg_text}" ]]; then
     --manager
     --num_frames_to_send 10
     --target_fps 50
-    --cuda
     --port "${PICO_PORT}"
   )
+  if [[ "${SONIC_PICO_USE_CUDA,,}" == "1" || "${SONIC_PICO_USE_CUDA,,}" == "true" || "${SONIC_PICO_USE_CUDA,,}" == "yes" || "${SONIC_PICO_USE_CUDA,,}" == "on" ]]; then
+    PICO_MANAGER_ARGS+=(--cuda)
+  fi
   if [[ "${PICO_ENABLE_VIS:-0}" == "1" ]]; then
     PICO_MANAGER_ARGS+=(--vis_vr3pt --vis_smpl)
   fi

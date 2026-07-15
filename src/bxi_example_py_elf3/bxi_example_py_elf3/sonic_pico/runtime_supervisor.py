@@ -40,6 +40,13 @@ def default_pico_python_executable() -> str:
     return sys.executable
 
 
+def env_flag_enabled(env: dict[str, str], name: str, default: bool = False) -> bool:
+    value = env.get(name)
+    if value is None:
+        return default
+    return value.strip().lower() in ("1", "true", "yes", "on")
+
+
 def state_requests_sonic(info: Any, target: str = "sonic_teleop") -> bool:
     """Return the desired runtime state from a state-machine snapshot."""
     if not isinstance(info, dict):
@@ -146,10 +153,11 @@ class PicoPipeline:
             "10",
             "--target_fps",
             "50",
-            "--cuda",
             "--port",
             pico_port,
         ]
+        if env_flag_enabled(env, "SONIC_PICO_USE_CUDA", default=False):
+            manager.append("--cuda")
         bridge = [
             self.python_executable,
             "-m",
