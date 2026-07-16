@@ -64,6 +64,11 @@ The tablet app should not be modified for this branch. Deploy the compiled ROS
 packages by overwriting the existing example install under `/opt/bxi`, after
 taking a backup.
 
+For robots with slow or unavailable GitHub access, use the commit-pinned
+offline bundle workflow in `docs/SONIC_ELF3_OFFLINE_DEPLOY.md`. It installs the
+PICO venv and the separate controller Python dependencies as well as the ROS
+packages, and verifies every payload file before changing `/opt`.
+
 On each robot:
 
 ```bash

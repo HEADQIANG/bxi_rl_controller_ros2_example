@@ -847,3 +847,17 @@ ss -antp | grep -E ':(5556|5557|60061|8081)\b' || true
 6. “机器人动了一下”不等于遥操成功，必须确认 `5556 pose` 和 `5557 smpl_ref` 都持续输出且 SONIC 使用 `live_reference`；
 7. 若 live 数据链路正常但机器人仍像卡静止姿势，先重启机器人清理残留状态，本次该问题即通过重启解决；
 8. 新机器人 `/opt` 控制节点环境容易缺 `pyzmq`，即使 PICO venv 正常，`bxi_example_py_elf3_demo` 仍会因 `ModuleNotFoundError: No module named 'zmq'` 退出，必须单独检查 controller Python deps。
+
+## 7. 后续固化结果（2026-07-16）
+
+上述实机问题已进一步固化为可重复的离线部署流程：
+
+- `script/audit_robot_sonic_host.sh`：部署前只读盘点系统、磁盘、基础 ROS、进程和端口；
+- `script/prepare_robot_sonic_bundle.sh`：从干净 Git commit 生成版本唯一、带 SHA256 的精简离线包；
+- `script/deploy_robot_sonic_bundle.sh`：校验 payload 后构建、备份、覆盖 `/opt` 并执行完整检查；
+- `script/install_robot_sonic_runtime_offline.sh`：分别安装 PICO venv 和 `/opt` 控制节点依赖；
+- `docs/SONIC_ELF3_OFFLINE_DEPLOY.md`：记录上传、部署、成功标准与回滚流程。
+
+离线包不再包含 NumPy 2.x，也不包含 headless 实机路径不需要的 VTK/PyVista。部署脚本会
+拒绝同一依赖存在多个候选 wheel，从源头避免 pip 选错版本；源码 commit 也会在 build 前
+核对，避免机器人上的代码、报告和 GitHub 分支互不一致。

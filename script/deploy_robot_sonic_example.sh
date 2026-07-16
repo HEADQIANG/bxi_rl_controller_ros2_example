@@ -7,6 +7,8 @@ SRC_DIR="${SRC_DIR:-${HOME}/bxi_rl_controller_ros2_example}"
 OPT_PREFIX="${OPT_PREFIX:-/opt/bxi/bxi_rl_controller_ros2_example}"
 BUILD_INSTALL="${BUILD_INSTALL:-/tmp/elf3_sonic_install}"
 BACKUP_DIR="${BACKUP_DIR:-/opt/bxi/deploy_backups}"
+OFFLINE_SOURCE="${OFFLINE_SOURCE:-0}"
+EXPECTED_COMMIT="${EXPECTED_COMMIT:-}"
 
 if [[ "${EUID}" -eq 0 ]]; then
   SUDO=()
@@ -31,7 +33,21 @@ echo "[deploy] branch=${BRANCH}"
 echo "[deploy] src=${SRC_DIR}"
 echo "[deploy] opt=${OPT_PREFIX}"
 
-if [[ -d "${SRC_DIR}/.git" ]]; then
+if [[ "${OFFLINE_SOURCE}" == "1" ]]; then
+  if [[ ! -f "${SRC_DIR}/src/bxi_example_py_elf3/package.xml" ]] || \
+     [[ ! -f "${SRC_DIR}/src/remote_controller/package.xml" ]]; then
+    echo "[deploy] ERROR: offline source tree is incomplete: ${SRC_DIR}"
+    exit 2
+  fi
+  cd "${SRC_DIR}"
+  if [[ -d .git ]]; then
+    source_commit="$(git rev-parse HEAD)"
+  elif [[ -r SONIC_DEPLOY_COMMIT ]]; then
+    source_commit="$(tr -d '[:space:]' < SONIC_DEPLOY_COMMIT)"
+  else
+    source_commit="unknown"
+  fi
+elif [[ -d "${SRC_DIR}/.git" ]]; then
   cd "${SRC_DIR}"
   if [[ "${ALLOW_DIRTY:-0}" != "1" ]] && [[ -n "$(git status --porcelain)" ]]; then
     echo "[deploy] ERROR: ${SRC_DIR} has local changes."
@@ -44,9 +60,17 @@ if [[ -d "${SRC_DIR}/.git" ]]; then
 else
   git clone -b "${BRANCH}" --single-branch "${REPO_URL}" "${SRC_DIR}"
   cd "${SRC_DIR}"
+  source_commit="$(git rev-parse HEAD)"
 fi
 
-echo "[deploy] commit=$(git rev-parse --short HEAD)"
+if [[ "${OFFLINE_SOURCE}" != "1" ]]; then
+  source_commit="$(git rev-parse HEAD)"
+fi
+if [[ -n "${EXPECTED_COMMIT}" ]] && [[ "${source_commit}" != "${EXPECTED_COMMIT}"* ]]; then
+  echo "[deploy] ERROR: source commit ${source_commit} does not match expected ${EXPECTED_COMMIT}"
+  exit 2
+fi
+echo "[deploy] commit=${source_commit} offline=${OFFLINE_SOURCE}"
 
 source_setup /opt/ros/humble/setup.bash
 source_setup /opt/bxi/bxi_ros2_pkg/setup.bash
