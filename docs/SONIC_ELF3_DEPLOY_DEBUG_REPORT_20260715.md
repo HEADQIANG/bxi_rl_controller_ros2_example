@@ -58,6 +58,12 @@ ModuleNotFoundError: No module named 'torch'
 ImportError: XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run the manager.
 ```
 
+或：
+
+```text
+ImportError: libPXREARobotSDK.so: cannot open shared object file: No such file or directory
+```
+
 处理：
 
 补齐：
@@ -65,16 +71,27 @@ ImportError: XRoboToolkit SDK not available. Install xrobotoolkit_sdk to run the
 - `/home/bxi/bxi_rl_controller_ros2_example-main/.venv_teleop`
 - `xrobotoolkit_sdk.cpython-310-x86_64-linux-gnu.so`
 - `/opt/apps/roboticsservice/RoboticsServiceProcess`
+- `/opt/apps/roboticsservice/SDK/x64/libPXREARobotSDK.so`
+
+注意：第二种报错不是 Python binding 缺失，而是 binding 的 native 依赖库不在动态链接器搜索路径里。`sonic_pico_runtime_supervisor` 必须在启动 PICO manager/bridge 子进程前把 RoboticsService 库目录加入 `LD_LIBRARY_PATH`，至少包含：
+
+```text
+/opt/apps/roboticsservice/SDK/x64
+/opt/apps/roboticsservice
+/opt/apps/roboticsservice/lib
+```
 
 验证：
 
 ```bash
+LD_LIBRARY_PATH=/opt/apps/roboticsservice/SDK/x64:/opt/apps/roboticsservice:${LD_LIBRARY_PATH:-} \
 /home/bxi/bxi_rl_controller_ros2_example-main/.venv_teleop/bin/python - <<'PY'
 import xrobotoolkit_sdk
 print("xrt OK", xrobotoolkit_sdk)
 PY
 
 ls -lh /opt/apps/roboticsservice/RoboticsServiceProcess
+ls -lh /opt/apps/roboticsservice/SDK/x64/libPXREARobotSDK.so
 ```
 
 ### 2.3 ROS setup 在 `set -u` 下报 `AMENT_TRACE_SETUP_FILES: unbound variable`
@@ -113,7 +130,74 @@ grep -n -- '--cuda\|SONIC_PICO_USE_CUDA' \
 
 期望只看到条件追加 `--cuda`，不能固定带 `--cuda`。
 
-### 2.5 PICO 能连接但一 send 就 socket error
+### 2.5 控制节点环境缺 `zmq`
+
+现象：
+
+```text
+[bxi_example_py_elf3_demo-2] ModuleNotFoundError: No module named 'zmq'
+[ERROR] [bxi_example_py_elf3_demo-2]: process has died [exit code 1]
+```
+
+这时 `hardware_elf3` 和 `sonic_pico_runtime_supervisor` 可能还活着，但真正发布控制命令、驱动状态机的 `bxi_example_py_elf3_demo` 已经退出。表现为机器人控制框架没有接上，`/hardware/state_machine_info` 可能没有发布，或者状态切换无法进入完整 SONIC 控制链路。
+
+原因：
+
+`bxi_example_py_elf3_demo` 是 ROS install 里的 console script，通常由 `/usr/bin/python3` 加 `/opt/bxi/bxi_rl_controller_ros2_example/lib/python3.10/site-packages` 启动；它不是 PICO 专用 venv。即使 PICO venv 检查通过，也只能证明 PICO manager/bridge 的 venv 依赖完整，不能证明控制节点环境有 `zmq`。
+
+修复：
+
+优先从离线 wheelhouse 安装到 `/opt` install 的 site-packages：
+
+```bash
+PYVENV=/home/bxi/bxi_rl_controller_ros2_example-main/.venv_teleop/bin/python
+TARGET=/opt/bxi/bxi_rl_controller_ros2_example/lib/python3.10/site-packages
+
+ZMQ_WHL=$(find /tmp/elf3_sonic_runtime_deps_20260716/wheels -maxdepth 1 -type f -iname '*zmq*.whl' | head -1)
+sudo "$PYVENV" -m pip install --no-index --no-deps --target "$TARGET" --upgrade "$ZMQ_WHL"
+```
+
+如果临时目录或 wheelhouse 已不存在，可从已验证的 PICO venv 复制：
+
+```bash
+PYVENV_SITE=$(/home/bxi/bxi_rl_controller_ros2_example-main/.venv_teleop/bin/python - <<'PY'
+import site
+print(site.getsitepackages()[0])
+PY
+)
+
+TARGET=/opt/bxi/bxi_rl_controller_ros2_example/lib/python3.10/site-packages
+
+sudo cp -a "$PYVENV_SITE"/zmq "$TARGET"/
+sudo cp -a "$PYVENV_SITE"/pyzmq-*.dist-info "$TARGET"/
+sudo cp -a "$PYVENV_SITE"/pyzmq.libs "$TARGET"/ 2>/dev/null || true
+```
+
+验证控制节点环境，而不是 PICO venv：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /opt/bxi/bxi_ros2_pkg/setup.bash
+source /opt/bxi/bxi_rl_controller_ros2_example/setup.bash
+
+python3 - <<'PY'
+import importlib
+for name in ["numpy", "onnxruntime", "zmq", "bxi_example_py_elf3.inference.sonic"]:
+    mod = importlib.import_module(name)
+    print(name, getattr(mod, "__version__", "unknown"), getattr(mod, "__file__", "unknown"))
+PY
+```
+
+修复成功后，终端启动 `run_robot_sonic_hw.sh` 应看到：
+
+```text
+[bxi_example_py_elf3_demo]: state graph loaded
+robot reset 1!
+robot reset 2!
+[CONTROL RATE] state=zero_torque, hz=50.0
+```
+
+### 2.6 PICO 能连接但一 send 就 socket error
 
 这是本次最关键问题。
 
@@ -194,7 +278,7 @@ ZMQ socket bound to port 5556
 - 需要调整启动架构：进入 SONIC/PICO 前释放 `8081`，或改 gateway 端口；
 - 如果 PICO 端将来支持端口配置，也可以改 PICO 目标端口，但当前 PICO 不能配置端口。
 
-### 2.6 缺 pinocchio
+### 2.7 缺 pinocchio
 
 现象：
 
@@ -217,7 +301,7 @@ ModuleNotFoundError: No module named 'pinocchio'
 - `hpp_fcl`
 - `cmeel*`
 
-### 2.7 NumPy 2.x ABI 与 pin/eigenpy 不兼容
+### 2.8 NumPy 2.x ABI 与 pin/eigenpy 不兼容
 
 现象：
 
@@ -284,7 +368,7 @@ print("all OK")
 PY
 ```
 
-### 2.8 进入 POSE 后机器人只换到另一个静止姿势
+### 2.9 进入 POSE 后机器人只换到另一个静止姿势
 
 现象：
 
@@ -503,6 +587,7 @@ bash "$HOME/bxi_rl_controller_ros2_example/script/deploy_robot_sonic_example.sh"
 ```text
 /home/bxi/bxi_rl_controller_ros2_example-main/.venv_teleop/bin/python
 /opt/apps/roboticsservice/RoboticsServiceProcess
+/opt/apps/roboticsservice/SDK/x64/libPXREARobotSDK.so
 ```
 
 验证：
@@ -514,9 +599,28 @@ bash ~/bxi_rl_controller_ros2_example/script/check_sonic_pico_python.sh \
 bash ~/bxi_rl_controller_ros2_example/script/check_robot_sonic_runtime.sh
 ```
 
-注意：检查脚本应补充 `pinocchio/eigenpy/hppfcl` 和 NumPy 版本检查。
+注意：检查脚本已覆盖 `pinocchio/eigenpy/hppfcl`、NumPy 版本、XRT native library path 和 controller Python 依赖检查。
 
-### 3.3 检查 8081 端口冲突
+### 3.3 验证控制节点 Python 环境
+
+`bxi_example_py_elf3_demo` 不使用 PICO venv。每台新机器人覆盖 `/opt` 包后，都必须验证 ROS 控制节点环境能 import SONIC policy 需要的依赖：
+
+```bash
+source /opt/ros/humble/setup.bash
+source /opt/bxi/bxi_ros2_pkg/setup.bash
+source /opt/bxi/bxi_rl_controller_ros2_example/setup.bash
+
+python3 - <<'PY'
+import importlib
+for name in ["numpy", "onnxruntime", "zmq", "bxi_example_py_elf3.inference.sonic"]:
+    mod = importlib.import_module(name)
+    print(name, getattr(mod, "__version__", "unknown"), getattr(mod, "__file__", "unknown"))
+PY
+```
+
+如果缺 `zmq`，`bxi_example_py_elf3_demo` 会 exit code 1，控制框架不会接入机器人。
+
+### 3.4 检查 8081 端口冲突
 
 PICO 不能配端口，默认使用 `8081`。部署 SONIC/PICO 前必须确认：
 
@@ -532,7 +636,7 @@ sudo ss -lntup | grep ':8081' || true
 
 则 PICO 会连错服务，send 后 socket error。
 
-### 3.4 验证 PICO body data 是否真正进 manager
+### 3.5 验证 PICO body data 是否真正进 manager
 
 启动 manager 后观察：
 
@@ -554,7 +658,7 @@ ss -lntup | grep -E ':(5556|5557|60061|8081)\b'
 - 只有 `5557 LISTEN`：bridge 在等 pose，但 manager 没出数据；
 - SONIC idle 姿势正常只代表 fallback `idle_reference` 正常，不代表 live PICO 正常。
 
-### 3.5 ABXY / A+X 成功判断
+### 3.6 ABXY / A+X 成功判断
 
 成功日志：
 
@@ -573,7 +677,7 @@ ss -lntup | grep -E ':(5556|5557|60061|8081)\b'
 
 SONIC policy 成功切 live 后应从 `idle_reference` 变为 `live_reference`。
 
-### 3.6 Live 跟随成功判断
+### 3.7 Live 跟随成功判断
 
 只看到机器人从 sonic idle 变到另一个姿势还不够，必须确认 live 数据持续：
 
@@ -605,6 +709,17 @@ SONIC policy 成功切 live 后应从 `idle_reference` 变为 `live_reference`�
 - `eigenpy`
 - `hppfcl`
 - `/opt/apps/roboticsservice/RoboticsServiceProcess`
+- `/opt/apps/roboticsservice/SDK/x64/libPXREARobotSDK.so`
+- `LD_LIBRARY_PATH` 中可发现 RoboticsService native libs，否则 `xrobotoolkit_sdk` 会因 `libPXREARobotSDK.so` 加载失败
+
+`script/check_robot_sonic_runtime.sh` 还必须检查 ROS 控制节点环境，即 source `/opt` install 后的 `python3` 能导入：
+
+- `numpy`
+- `onnxruntime`
+- `zmq`
+- `bxi_example_py_elf3.inference.sonic`
+
+这是为了避免 `check_sonic_pico_python.sh` 通过，但 `bxi_example_py_elf3_demo` 仍因缺 `zmq` 直接退出。
 
 ### 4.2 必须补进离线 wheelhouse
 
@@ -620,6 +735,7 @@ cmeel*
 torch CPU
 pyzmq
 msgpack
+onnxruntime
 ```
 
 ### 4.3 必须补进 8081 端口检查
@@ -665,7 +781,22 @@ echo "===== ports ====="
 sudo ss -lntup | grep -E ':(8081|60061|5556|5557)\b' || true
 sudo ss -antup | grep -E ':(8081|60061|5556|5557)\b' || true
 
-echo "===== python deps ====="
+echo "===== controller python deps ====="
+source /opt/ros/humble/setup.bash
+source /opt/bxi/bxi_ros2_pkg/setup.bash
+source /opt/bxi/bxi_rl_controller_ros2_example/setup.bash
+python3 - <<'PY'
+import importlib
+mods = ["numpy", "onnxruntime", "zmq", "bxi_example_py_elf3.inference.sonic"]
+for name in mods:
+    try:
+        mod = importlib.import_module(name)
+        print(f"[OK] {name}: {getattr(mod, '__version__', 'unknown')}")
+    except Exception as exc:
+        print(f"[FAIL] {name}: {exc!r}")
+PY
+
+echo "===== pico venv python deps ====="
 $PY - <<'PY'
 import sys
 print("python", sys.executable)
@@ -702,7 +833,7 @@ echo "===== live stream ports ====="
 ss -antp | grep -E ':(5556|5557|60061|8081)\b' || true
 ```
 
-并用第 2.8 节的 `5556 pose` / `5557 smpl_ref` 采样脚本检查帧号是否持续增长。
+并用第 3.7 节的 `5556 pose` / `5557 smpl_ref` 采样脚本检查帧号是否持续增长。
 
 ## 6. 最短结论
 
@@ -714,4 +845,5 @@ ss -antp | grep -E ':(5556|5557|60061|8081)\b' || true
 4. 机器人无 CUDA，manager 默认必须 CPU-only；
 5. 新机器人部署必须使用离线 wheelhouse，不能依赖现场公网下载；
 6. “机器人动了一下”不等于遥操成功，必须确认 `5556 pose` 和 `5557 smpl_ref` 都持续输出且 SONIC 使用 `live_reference`；
-7. 若 live 数据链路正常但机器人仍像卡静止姿势，先重启机器人清理残留状态，本次该问题即通过重启解决。
+7. 若 live 数据链路正常但机器人仍像卡静止姿势，先重启机器人清理残留状态，本次该问题即通过重启解决；
+8. 新机器人 `/opt` 控制节点环境容易缺 `pyzmq`，即使 PICO venv 正常，`bxi_example_py_elf3_demo` 仍会因 `ModuleNotFoundError: No module named 'zmq'` 退出，必须单独检查 controller Python deps。

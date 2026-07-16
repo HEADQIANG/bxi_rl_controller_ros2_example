@@ -57,6 +57,37 @@ else
   warn "installed hardware launch file not found under /opt/bxi"
 fi
 
+section "Controller Python dependencies"
+if python3 - <<'PY'
+import importlib
+import sys
+
+required = [
+    "numpy",
+    "onnxruntime",
+    "zmq",
+    "bxi_example_py_elf3.inference.sonic",
+]
+
+failed = False
+for name in required:
+    try:
+        module = importlib.import_module(name)
+        version = getattr(module, "__version__", "unknown")
+        location = getattr(module, "__file__", "unknown")
+        print(f"[OK] import {name}: {version} ({location})")
+    except Exception as exc:
+        failed = True
+        print(f"[FAIL] import {name}: {exc!r}")
+
+sys.exit(1 if failed else 0)
+PY
+then
+  ok "controller Python dependency check passed"
+else
+  fail "controller Python dependency check failed; bxi_example_py_elf3_demo may exit before controlling the robot"
+fi
+
 section "PICO Python dependencies"
 if "${SCRIPT_DIR}/check_sonic_pico_python.sh"; then
   ok "PICO Python dependency check passed"

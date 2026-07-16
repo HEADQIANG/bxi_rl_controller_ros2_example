@@ -47,6 +47,24 @@ def env_flag_enabled(env: dict[str, str], name: str, default: bool = False) -> b
     return value.strip().lower() in ("1", "true", "yes", "on")
 
 
+def prepend_existing_ld_paths(env: dict[str, str], paths: list[str]) -> list[str]:
+    """Prepend existing native-library paths to LD_LIBRARY_PATH.
+
+    The xrobotoolkit_sdk Python extension is installed in the PICO venv, but it
+    depends on libPXREARobotSDK.so from the RoboticsService installation.  That
+    dependency must be discoverable before importing the Python extension, so
+    the child process environment has to be fixed by the supervisor.
+    """
+    old_paths = [path for path in env.get("LD_LIBRARY_PATH", "").split(":") if path]
+    added: list[str] = []
+    for path in paths:
+        if path and os.path.isdir(path) and path not in old_paths and path not in added:
+            added.append(path)
+    if added:
+        env["LD_LIBRARY_PATH"] = ":".join(added + old_paths)
+    return added
+
+
 def state_requests_sonic(info: Any, target: str = "sonic_teleop") -> bool:
     """Return the desired runtime state from a state-machine snapshot."""
     if not isinstance(info, dict):
@@ -130,6 +148,15 @@ class PicoPipeline:
             return
         env = os.environ.copy()
         env.setdefault("PYTHONUNBUFFERED", "1")
+        xrt_service_dir = env.get("SONIC_XRT_SERVICE_DIR", "/opt/apps/roboticsservice")
+        xrt_ld_paths = prepend_existing_ld_paths(
+            env,
+            [
+                os.path.join(xrt_service_dir, "SDK", "x64"),
+                xrt_service_dir,
+                os.path.join(xrt_service_dir, "lib"),
+            ],
+        )
         pico_port = env.get("PICO_PORT", "5556")
         out_host = env.get(
             "BXI_SONIC_SMPL_REF_ZMQ_HOST",
@@ -188,6 +215,10 @@ class PicoPipeline:
             bridge.append("--disable-ros-pico-topics")
 
         self.logger.info("starting SONIC PICO manager and bridge")
+        if xrt_ld_paths:
+            self.logger.info(
+                "SONIC PICO native library path includes: " + ", ".join(xrt_ld_paths)
+            )
         self.stop_started_at = None
         self.stop_stage = 0
         try:

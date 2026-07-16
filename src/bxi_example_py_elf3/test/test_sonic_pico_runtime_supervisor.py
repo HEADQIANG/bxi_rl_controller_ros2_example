@@ -9,6 +9,7 @@ from bxi_example_py_elf3.sonic_pico.runtime_supervisor import (
     ChildProcess,
     PicoPipeline,
     StateSnapshotMonitor,
+    prepend_existing_ld_paths,
 )
 
 
@@ -201,6 +202,57 @@ def test_bridge_spawn_failure_escalates_and_reaps_manager_group(monkeypatch):
 
 def _option(command, name):
     return command[command.index(name) + 1]
+
+
+def test_native_library_paths_are_prepended_once(tmp_path):
+    sdk_dir = tmp_path / "SDK" / "x64"
+    lib_dir = tmp_path / "lib"
+    sdk_dir.mkdir(parents=True)
+    lib_dir.mkdir()
+    existing = tmp_path / "existing"
+    existing.mkdir()
+    env = {"LD_LIBRARY_PATH": f"{existing}:{lib_dir}"}
+
+    added = prepend_existing_ld_paths(
+        env,
+        [str(sdk_dir), str(tmp_path), str(lib_dir), str(sdk_dir)],
+    )
+
+    assert added == [str(sdk_dir), str(tmp_path)]
+    assert env["LD_LIBRARY_PATH"].split(":") == [
+        str(sdk_dir),
+        str(tmp_path),
+        str(existing),
+        str(lib_dir),
+    ]
+
+
+def test_pipeline_passes_xrt_native_paths_to_both_children(monkeypatch, tmp_path):
+    sdk_dir = tmp_path / "SDK" / "x64"
+    lib_dir = tmp_path / "lib"
+    sdk_dir.mkdir(parents=True)
+    lib_dir.mkdir()
+    processes = [FakeProcess(pid=351), FakeProcess(pid=352)]
+    popen_calls = []
+
+    def fake_popen(command, **kwargs):
+        popen_calls.append((command, kwargs))
+        return processes[len(popen_calls) - 1]
+
+    monkeypatch.setenv("SONIC_XRT_SERVICE_DIR", str(tmp_path))
+    monkeypatch.setenv("LD_LIBRARY_PATH", "/already-present")
+    monkeypatch.setattr(runtime_supervisor.subprocess, "Popen", fake_popen)
+
+    PicoPipeline(FakeLogger(), "python3").start()
+
+    assert len(popen_calls) == 2
+    for _, kwargs in popen_calls:
+        assert kwargs["env"]["LD_LIBRARY_PATH"].split(":") == [
+            str(sdk_dir),
+            str(tmp_path),
+            str(lib_dir),
+            "/already-present",
+        ]
 
 
 @pytest.mark.parametrize(

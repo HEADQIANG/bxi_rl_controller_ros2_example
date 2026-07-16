@@ -28,7 +28,19 @@ meshes are not needed by the default headless PICO path; `PICO_ENABLE_VIS=1` is
 not supported by this source-only dependency subset. The supervisor normally
 uses its own Python interpreter; set `SONIC_PICO_PYTHON` to the deployment
 virtualenv interpreter when the PICO dependencies live in a separate venv. The
-provided Sim2Sim script detects `<repo>/.venv_teleop/bin/python` automatically.
+`xrobotoolkit_sdk` extension also needs RoboticsService native libraries, most
+importantly `/opt/apps/roboticsservice/SDK/x64/libPXREARobotSDK.so`. The
+supervisor prepends the standard RoboticsService library directories to
+`LD_LIBRARY_PATH` for the PICO manager/bridge children before they import the
+SDK. The provided Sim2Sim script detects `<repo>/.venv_teleop/bin/python`
+automatically.
+
+The main `bxi_example_py_elf3_demo` controller is a separate ROS console script
+and runs in the installed ROS Python environment, not in the PICO venv. Make
+sure that environment can import `numpy`, `onnxruntime`, `zmq` and
+`bxi_example_py_elf3.inference.sonic`; otherwise the controller can exit before
+publishing motor commands even when the PICO venv check passes.
+
 On the robot, the hardware launch also auto-detects the known deployment venv
 locations, including:
 

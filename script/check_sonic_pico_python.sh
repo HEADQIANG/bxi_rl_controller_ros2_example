@@ -29,6 +29,27 @@ fi
 
 echo "[INFO] PICO Python: ${PYTHON_BIN}"
 
+XRT_SERVICE_DIR="${SONIC_XRT_SERVICE_DIR:-/opt/apps/roboticsservice}"
+PRECHECK_FAILED=0
+for candidate in \
+  "${XRT_SERVICE_DIR}/SDK/x64" \
+  "${XRT_SERVICE_DIR}" \
+  "${XRT_SERVICE_DIR}/lib"; do
+  if [[ -d "${candidate}" ]]; then
+    case ":${LD_LIBRARY_PATH:-}:" in
+      *:"${candidate}":*) ;;
+      *) export LD_LIBRARY_PATH="${candidate}${LD_LIBRARY_PATH:+:${LD_LIBRARY_PATH}}" ;;
+    esac
+  fi
+done
+
+if [[ -r "${XRT_SERVICE_DIR}/SDK/x64/libPXREARobotSDK.so" ]]; then
+  echo "[OK] libPXREARobotSDK.so exists"
+else
+  echo "[FAIL] missing ${XRT_SERVICE_DIR}/SDK/x64/libPXREARobotSDK.so"
+  PRECHECK_FAILED=1
+fi
+
 "${PYTHON_BIN}" - <<'PY'
 import importlib
 import sys
@@ -73,10 +94,14 @@ sys.exit(1 if failed else 0)
 PY
 PY_STATUS=$?
 
-if [[ -x /opt/apps/roboticsservice/RoboticsServiceProcess ]]; then
+if [[ -x "${XRT_SERVICE_DIR}/RoboticsServiceProcess" ]]; then
   echo "[OK] RoboticsServiceProcess exists"
 else
-  echo "[WARN] missing /opt/apps/roboticsservice/RoboticsServiceProcess"
+  echo "[FAIL] missing ${XRT_SERVICE_DIR}/RoboticsServiceProcess"
+  PRECHECK_FAILED=1
 fi
 
+if (( PRECHECK_FAILED != 0 )); then
+  exit 1
+fi
 exit "${PY_STATUS}"
