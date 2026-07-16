@@ -101,6 +101,9 @@ bash "$HOME/bxi_rl_controller_ros2_example/script/run_robot_sonic_hw.sh"
 bash "$HOME/bxi_rl_controller_ros2_example/script/run_robot_sonic_controller.sh"
 ```
 
+The complete pre-tablet terminal acceptance and cleanup procedure is in
+`docs/SONIC_ELF3_TERMINAL_ACCEPTANCE.md`.
+
 Keyboard state flow is `!` (PD brake), `1` (normal), then `6` (SONIC). After
 SONIC starts and PICO body data is available, press `ABXY` to calibrate/start
 and `A+X` to switch to POSE/live.

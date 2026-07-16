@@ -118,16 +118,12 @@ else
   warn "no 5556/5557/60061/8081 listeners; this is expected before SONIC/PICO starts"
 fi
 
-section "PICO external port 8081"
+section "Observed port 8081"
 if port_8081="$(ss -lntup 2>/dev/null | grep -E ':8081\b' || true)" && [[ -n "${port_8081}" ]]; then
   echo "${port_8081}"
-  if grep -q 'RoboticsService' <<<"${port_8081}"; then
-    ok "8081 is owned by RoboticsService"
-  else
-    fail "8081 is occupied by a non-RoboticsService process; PICO cannot change ports and will hit the wrong service"
-  fi
+  warn "recording 8081 ownership for diagnostics; it is not a deployment blocker by itself"
 else
-  ok "8081 is free before PICO runtime starts"
+  ok "8081 is currently free"
 fi
 
 section "Result"

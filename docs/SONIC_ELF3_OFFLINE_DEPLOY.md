@@ -95,7 +95,7 @@ bash source/script/deploy_robot_sonic_bundle.sh "$PWD"
 - PICO venv 的 NumPy、SciPy、torch CPU、pinocchio、XRT 全部可导入；
 - 控制节点 Python 可导入 `numpy`、`onnxruntime`、`zmq` 和 SONIC policy；
 - `RoboticsServiceProcess` 与 `SDK/x64/libPXREARobotSDK.so` 存在；
-- `8081` 没有被非 RoboticsService 服务错误占用。
+- 记录 `8081` owner 作为诊断基线，但不把 gateway 占用本身当成失败条件。
 
 动态验证时还必须看到：
 

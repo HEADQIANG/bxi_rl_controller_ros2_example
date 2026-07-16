@@ -227,9 +227,11 @@ sudo ss -antup | grep -E '192\.168\.88\.210|8081|60061|5556|5557'
 no 5556 LISTEN
 ```
 
-根因：
+2026-07-16 复核结论：
 
-PICO 端不能配置端口，默认连接机器人 `8081`。但机器人启动平板 gateway 后，`api_server_node` 占用了 `0.0.0.0:8081`。因此 PICO 实际连到的是 robot gateway，不是 RoboticsService 的 PICO/XRT body tracking 入口。连接可建立，但协议不匹配，一 send 就 socket error。
+当时抓包看到 PICO 设备与机器人 `8081` 通信，同时停止 gateway、重启并手动运行 manager 后出现了 `Body data available`，因此调试过程中曾把问题归因为 `8081` 端口冲突。但这个 A/B 实验同时改变了旧进程、runtime 状态和启动顺序，不能单独证明 `8081` owner 就是根因。后续实测已经证明：由平板启动控制框架、切到 `sonic_teleop` 后，PICO 可以连接同一个机器人 IP，并完成 ABXY、A+X 和连续遥操。
+
+因此，`api_server_node/robot_gateway` 占用 `8081` 只作为网络拓扑观察信息，不能再据此判定部署失败，也不应在正常测试前自动停止 gateway。send socket error 应按实际数据链路重新定位。
 
 正确理解：
 
@@ -237,7 +239,7 @@ PICO 端不能配置端口，默认连接机器人 `8081`。但机器人启动�
 - 它不证明 PICO live 数据进来了；
 - 没有 `5556 LISTEN` 时，ABXY / A+X 必然无效。
 
-临时验证方案：
+当 PICO send 异常时的隔离验证方案：
 
 ```bash
 sudo pkill -f 'socat.*60061' 2>/dev/null || true
@@ -272,11 +274,13 @@ Body data available
 ZMQ socket bound to port 5556
 ```
 
-长期方案：
+上述停止 gateway、手动启动 manager 的步骤只用于受控 A/B，不是正常部署流程。正常验收应保留实际平板/终端启动架构，并以下列事实判断链路：
 
-- SONIC/PICO 模式下不能让 `robot_gateway/api_server_node` 占用 `8081`；
-- 需要调整启动架构：进入 SONIC/PICO 前释放 `8081`，或改 gateway 端口；
-- 如果 PICO 端将来支持端口配置，也可以改 PICO 目标端口，但当前 PICO 不能配置端口。
+- manager 输出 `Body data available`；
+- `5556 pose` 持续输出；
+- `5557 smpl_ref` 持续输出且 `source_ready=true`；
+- SONIC policy 使用 `live_reference`；
+- 机器人连续跟随，而不是只变化一次姿势。
 
 ### 2.7 缺 pinocchio
 
@@ -620,9 +624,9 @@ PY
 
 如果缺 `zmq`，`bxi_example_py_elf3_demo` 会 exit code 1，控制框架不会接入机器人。
 
-### 3.4 检查 8081 端口冲突
+### 3.4 记录 8081 端口状态
 
-PICO 不能配端口，默认使用 `8081`。部署 SONIC/PICO 前必须确认：
+部署和排障时记录 `8081` owner 与连接即可：
 
 ```bash
 sudo ss -lntup | grep ':8081' || true
@@ -634,7 +638,7 @@ sudo ss -lntup | grep ':8081' || true
 0.0.0.0:8081 users:(api_server_node/robot_gateway/...)
 ```
 
-则 PICO 会连错服务，send 后 socket error。
+不能仅凭这一项判定冲突或停止 gateway。只有当 `Body data available`、`5556`、`5557` 没有建立时，才把端口和抓包结果与当前进程、当前日志一起分析。
 
 ### 3.5 验证 PICO body data 是否真正进 manager
 
@@ -738,7 +742,7 @@ msgpack
 onnxruntime
 ```
 
-### 4.3 必须补进 8081 端口检查
+### 4.3 保留 8081 观察信息
 
 部署/运行脚本应在启动 PICO runtime 前检查：
 
@@ -746,7 +750,7 @@ onnxruntime
 ss -lntup | grep ':8081'
 ```
 
-如果 `api_server_node` 或 `robot_gateway` 占用 `8081`，应明确报错或自动进入互斥流程，避免 PICO 连接错误服务。
+脚本应打印 owner 和连接作为诊断基线，但不能因为 `api_server_node` 或 `robot_gateway` 占用 `8081` 就让部署失败，也不能自动杀进程。最终以 5556/5557 数据流和 `live_reference` 为准。
 
 ### 4.4 CPU-only 默认必须保留
 
@@ -839,7 +843,7 @@ ss -antp | grep -E ':(5556|5557|60061|8081)\b' || true
 
 本次不是 ROS2 domain 问题，也不是 SONIC policy 不支持 live input。真正踩坑点是：
 
-1. PICO 默认连 `8081`，但 robot gateway 占了 `8081`，导致 send 即 socket error；
+1. `8081` owner 曾与 send socket error 同时出现，但后续平板 + PICO 实测证明它不是充分的失败条件，只保留为诊断信息；
 2. PICO venv 缺 `pinocchio/eigenpy/hpp_fcl`；
 3. `pin/eigenpy` 与 NumPy 2.x ABI 不兼容，需要 NumPy 1.26；
 4. 机器人无 CUDA，manager 默认必须 CPU-only；
