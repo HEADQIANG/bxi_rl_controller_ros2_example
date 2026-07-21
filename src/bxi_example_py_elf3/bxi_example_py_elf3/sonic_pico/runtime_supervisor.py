@@ -1,4 +1,4 @@
-"""Start the PICO runtime only while the ELF3 state machine needs SONIC."""
+"""Supervise PICO or PN-Link inputs for the ELF3 SONIC state."""
 
 from __future__ import annotations
 
@@ -11,9 +11,14 @@ import time
 from dataclasses import dataclass
 from typing import Any
 
-import rclpy
-from rclpy.node import Node
-from std_msgs.msg import String
+try:
+    import rclpy
+    from rclpy.node import Node
+    from std_msgs.msg import String
+except ImportError:  # pragma: no cover - process-lifecycle tests do not need ROS
+    rclpy = None
+    Node = object
+    String = None
 
 
 START_FAILURE_SIGINT_GRACE = 3.0
@@ -38,6 +43,13 @@ def default_pico_python_executable() -> str:
             return candidate
 
     return sys.executable
+
+
+def default_pnlink_python_executable() -> str:
+    return os.environ.get(
+        "SONIC_PNLINK_PYTHON",
+        "/opt/bxi/venvs/sonic_pnlink/bin/python",
+    )
 
 
 def env_flag_enabled(env: dict[str, str], name: str, default: bool = False) -> bool:
@@ -127,9 +139,15 @@ class ChildProcess:
 class PicoPipeline:
     """Non-blocking owner for the manager and bridge process groups."""
 
-    def __init__(self, logger, python_executable: str):
+    def __init__(
+        self,
+        logger,
+        python_executable: str,
+        runtime_name: str = "SONIC PICO runtime",
+    ):
         self.logger = logger
         self.python_executable = python_executable
+        self.runtime_name = runtime_name
         self.children: list[ChildProcess] = []
         self.stop_started_at: float | None = None
         self.stop_stage = 0
@@ -214,18 +232,31 @@ class PicoPipeline:
         ):
             bridge.append("--disable-ros-pico-topics")
 
-        self.logger.info("starting SONIC PICO manager and bridge")
+        self.logger.info(f"starting {self.runtime_name}")
         if xrt_ld_paths:
             self.logger.info(
                 "SONIC PICO native library path includes: " + ", ".join(xrt_ld_paths)
             )
+        self._spawn_commands(
+            (("manager", manager), ("bridge", bridge)),
+            env,
+        )
+
+    def _spawn_commands(
+        self,
+        commands: tuple[tuple[str, list[str]], ...],
+        env: dict[str, str],
+    ) -> None:
         self.stop_started_at = None
         self.stop_stage = 0
         try:
-            manager_proc = subprocess.Popen(manager, env=env, start_new_session=True)
-            self.children = [ChildProcess("manager", manager_proc)]
-            bridge_proc = subprocess.Popen(bridge, env=env, start_new_session=True)
-            self.children.append(ChildProcess("bridge", bridge_proc))
+            for name, command in commands:
+                process = subprocess.Popen(
+                    command,
+                    env=env,
+                    start_new_session=True,
+                )
+                self.children.append(ChildProcess(name, process))
         except BaseException as exc:
             if self.children:
                 try:
@@ -234,15 +265,15 @@ class PicoPipeline:
                     )
                 except BaseException as cleanup_exc:
                     self.logger.error(
-                        "failed while cleaning up a partially started SONIC PICO "
-                        f"runtime: {cleanup_exc}"
+                        f"failed while cleaning up a partially started "
+                        f"{self.runtime_name}: {cleanup_exc}"
                     )
             raise
 
     def request_stop(self, reason: str) -> None:
         if not self.children or self.stopping:
             return
-        self.logger.info(f"stopping SONIC PICO runtime: {reason}")
+        self.logger.info(f"stopping {self.runtime_name}: {reason}")
         self.stop_started_at = time.monotonic()
         self.stop_stage = 1
         self._signal(signal.SIGINT, process_group=True)
@@ -336,7 +367,7 @@ class PicoPipeline:
         result = ", ".join(
             f"{child.name}={child.process.returncode}" for child in self.children
         )
-        self.logger.info(f"SONIC PICO runtime stopped ({result})")
+        self.logger.info(f"{self.runtime_name} stopped ({result})")
         self.children = []
         self.stop_started_at = None
         self.stop_stage = 0
@@ -357,7 +388,7 @@ class PicoPipeline:
         self._reap_leaders(timeout=0.0)
         if self._finish_stop_if_complete() is None:
             self.logger.error(
-                "partially started SONIC PICO runtime still has live process groups "
+                f"partially started {self.runtime_name} still has live process groups "
                 "after SIGKILL; retaining ownership for subsequent cleanup"
             )
 
@@ -395,8 +426,243 @@ class PicoPipeline:
             self._reap_leaders(timeout=0.0)
             if self._finish_stop_if_complete() is None:
                 self.logger.error(
-                    "SONIC PICO runtime still has live process groups during shutdown"
+                    f"{self.runtime_name} still has live process groups during shutdown"
                 )
+
+
+class CommandPipeline(PicoPipeline):
+    """Use the existing process-group owner for a fixed command set."""
+
+    def __init__(
+        self,
+        logger,
+        python_executable: str,
+        runtime_name: str,
+        commands: tuple[tuple[str, list[str]], ...],
+        env: dict[str, str],
+    ):
+        super().__init__(logger, python_executable, runtime_name)
+        self.commands = commands
+        self.env = env
+
+    def start(self) -> None:
+        if self.children:
+            return
+        self.logger.info(f"starting {self.runtime_name}")
+        self._spawn_commands(self.commands, self.env.copy())
+
+
+class PnLinkRuntime:
+    """Own a persistent PN-Link source and a SONIC-state-scoped bridge."""
+
+    def __init__(self, logger, python_executable: str, env: dict[str, str]):
+        self.logger = logger
+        self.python_executable = python_executable
+        self.env = env.copy()
+        self.env.setdefault("PYTHONUNBUFFERED", "1")
+        topology = self.env.get("SONIC_PNLINK_TOPOLOGY", "local")
+        host = self.env.get("SONIC_PNLINK_HOST", "127.0.0.1")
+        bind_host = self.env.get("SONIC_PNLINK_BIND_HOST", "127.0.0.1")
+        if topology != "local":
+            raise ValueError("SONIC_PNLINK_TOPOLOGY must be local in the first version")
+        if host not in ("127.0.0.1", "localhost"):
+            raise ValueError("SONIC_PNLINK_HOST must be loopback")
+        if bind_host not in ("127.0.0.1", "localhost"):
+            raise ValueError("SONIC_PNLINK_BIND_HOST must be loopback")
+
+        pose_port = self.env.get("SONIC_PNLINK_PORT", "5556")
+        out_host = self.env.get(
+            "BXI_SONIC_SMPL_REF_ZMQ_HOST",
+            self.env.get("SMPL_REF_ZMQ_HOST", "127.0.0.1"),
+        )
+        if out_host not in ("127.0.0.1", "localhost"):
+            raise ValueError("PN-Link smpl_ref output host must be loopback")
+        out_port = self.env.get(
+            "BXI_SONIC_SMPL_REF_ZMQ_PORT",
+            self.env.get("SMPL_REF_ZMQ_PORT", "5557"),
+        )
+        out_topic = self.env.get(
+            "BXI_SONIC_SMPL_REF_ZMQ_TOPIC",
+            self.env.get("SMPL_REF_ZMQ_TOPIC", "smpl_ref"),
+        )
+        source_command = [
+            python_executable,
+            "-m",
+            "bxi_example_py_elf3.sonic_pnlink.pose_source",
+        ]
+        bridge_command = [
+            python_executable,
+            "-m",
+            "bxi_example_py_elf3.sonic_pico.pico_pose_to_smpl_ref_bridge",
+            "--source-kind",
+            "pnlink",
+            "--pose-host",
+            host,
+            "--pico-port",
+            pose_port,
+            "--pico-topic",
+            "pose",
+            "--out-host",
+            out_host,
+            "--out-port",
+            out_port,
+            "--out-topic",
+            out_topic,
+            "--stale-warning-seconds",
+            self.env.get("SONIC_PNLINK_STALE_SECONDS", "0.2"),
+            "--disable-ros-pico-topics",
+            "--disable-ros-diagnostics",
+        ]
+        self.source = CommandPipeline(
+            logger,
+            python_executable,
+            "SONIC PN-Link source",
+            (("PN-Link source", source_command),),
+            self.env,
+        )
+        self.bridge = CommandPipeline(
+            logger,
+            python_executable,
+            "SONIC PN-Link bridge",
+            (("PN-Link bridge", bridge_command),),
+            self.env,
+        )
+        self.viewer: CommandPipeline | None = None
+        diagnostics = env_flag_enabled(
+            self.env, "SONIC_PNLINK_DIAGNOSTICS", default=False
+        )
+        viewer_enabled = env_flag_enabled(
+            self.env, "SONIC_PNLINK_MUJOCO_VIEWER", default=False
+        )
+        if viewer_enabled and diagnostics:
+            viewer_command = [
+                "nice",
+                "-n",
+                "10",
+                python_executable,
+                "-m",
+                "bxi_example_py_elf3.sonic_pnlink.mujoco_viewer",
+            ]
+            self.viewer = CommandPipeline(
+                logger,
+                python_executable,
+                "SONIC PN-Link viewer",
+                (("PN-Link viewer", viewer_command),),
+                self.env,
+            )
+        elif viewer_enabled:
+            self.logger.warning(
+                "PN-Link viewer requested without SONIC_PNLINK_DIAGNOSTICS; "
+                "viewer will not start"
+            )
+        self.source_failed = False
+        self.viewer_failed = False
+
+    def start_persistent(self) -> None:
+        if self.source_failed:
+            raise RuntimeError("PN-Link source failed; supervisor restart is required")
+        self.source.start()
+        if self.viewer is not None:
+            try:
+                self.viewer.start()
+            except Exception as exc:
+                self.viewer_failed = True
+                self.logger.warning(f"failed to start optional PN-Link viewer: {exc}")
+
+    def start_bridge(self) -> None:
+        if self.source_failed or not self.source.running:
+            raise RuntimeError("PN-Link source is not running")
+        self.bridge.start()
+
+    def stop_bridge(self, reason: str) -> None:
+        self.bridge.request_stop(reason)
+
+    def terminate_source(self, reason: str) -> None:
+        self.source_failed = True
+        self.source.request_stop(reason)
+        self.bridge.request_stop(reason)
+
+    def poll(self) -> dict[str, str | None]:
+        result: dict[str, str | None] = {
+            "source": None,
+            "bridge": None,
+            "viewer": None,
+        }
+        source_exited = any(
+            child.process.poll() is not None for child in self.source.children
+        )
+        if source_exited and not self.source.stopping:
+            self.source_failed = True
+            self.logger.error("PN-Link source exited; live bridge is being stopped")
+            self.bridge.request_stop("PN-Link source exited")
+        result["source"] = self.source.poll()
+        result["bridge"] = self.bridge.poll()
+
+        if self.viewer is not None:
+            viewer_exited = any(
+                child.process.poll() is not None for child in self.viewer.children
+            )
+            if viewer_exited and not self.viewer.stopping and not self.viewer_failed:
+                self.viewer_failed = True
+                self.logger.warning(
+                    "optional PN-Link viewer exited; source and bridge continue"
+                )
+            result["viewer"] = self.viewer.poll()
+        return result
+
+    def close(self) -> None:
+        self.bridge.close()
+        if self.viewer is not None:
+            self.viewer.close()
+        self.source.close()
+
+
+def pnlink_ready_paused(payload: str) -> bool:
+    try:
+        status = json.loads(payload)
+    except (TypeError, ValueError):
+        return False
+    return (
+        isinstance(status, dict)
+        and status.get("state") == "READY_PAUSED"
+        and status.get("live_enabled") is False
+    )
+
+
+@dataclass
+class PnLinkPauseRequest:
+    started_at: float
+    future: Any = None
+    service_timeout: float = 0.2
+    status_timeout: float = 0.5
+    status_confirmed: bool = False
+
+    def observe_status(self, payload: str) -> None:
+        if pnlink_ready_paused(payload):
+            self.status_confirmed = True
+
+    def evaluate(self, now: float) -> str | None:
+        elapsed = now - self.started_at
+        if self.future is None:
+            if elapsed >= self.service_timeout:
+                return "service_unavailable"
+            return None
+        if not self.future.done():
+            if elapsed >= self.service_timeout:
+                return "service_timeout"
+            return None
+        if self.future.done():
+            try:
+                response = self.future.result()
+            except Exception:
+                return "service_failed"
+            if response is None or not bool(response.success):
+                return "service_failed"
+        if self.status_confirmed:
+            return "confirmed"
+        if elapsed >= self.status_timeout:
+            return "status_timeout"
+        return None
 
 
 class SonicPicoRuntimeSupervisor(Node):
@@ -407,17 +673,37 @@ class SonicPicoRuntimeSupervisor(Node):
         self.declare_parameter("enabled", True)
         self.declare_parameter("heartbeat_timeout", 1.0)
         self.declare_parameter("restart_delay", 3.0)
+        self.source_kind = os.environ.get("SONIC_TELEOP_SOURCE", "pico").strip().lower()
+        if self.source_kind not in ("pico", "pnlink"):
+            raise ValueError("SONIC_TELEOP_SOURCE must be pico or pnlink")
         self.declare_parameter(
             "python_executable",
             default_pico_python_executable(),
+        )
+        self.declare_parameter(
+            "pnlink_python_executable",
+            default_pnlink_python_executable(),
         )
         self.topic = str(self.get_parameter("state_machine_info_topic").value)
         self.target_state = str(self.get_parameter("target_state").value)
         self.enabled = bool(self.get_parameter("enabled").value)
         self.heartbeat_timeout = float(self.get_parameter("heartbeat_timeout").value)
         self.restart_delay = float(self.get_parameter("restart_delay").value)
-        python_executable = str(self.get_parameter("python_executable").value)
-        self.pipeline = PicoPipeline(self.get_logger(), python_executable)
+        if self.source_kind == "pnlink":
+            python_executable = str(
+                self.get_parameter("pnlink_python_executable").value
+            )
+        else:
+            python_executable = str(self.get_parameter("python_executable").value)
+        self.pipeline: PicoPipeline | None = None
+        self.pnlink_runtime: PnLinkRuntime | None = None
+        if self.source_kind == "pico":
+            self.pipeline = PicoPipeline(self.get_logger(), python_executable)
+        else:
+            self.get_logger().info(
+                "PN-Link uses the external pure-Python source/bridge runtime; "
+                "ROS lifecycle control is disabled"
+            )
         self.state_snapshot = StateSnapshotMonitor(
             target=self.target_state,
             enabled=self.enabled,
@@ -429,7 +715,8 @@ class SonicPicoRuntimeSupervisor(Node):
         self.subscription = self.create_subscription(String, self.topic, self._on_state, 10)
         self.timer = self.create_timer(0.1, self._tick)
         self.get_logger().info(
-            f"watching {self.topic} for state={self.target_state}, enabled={self.enabled}"
+            f"watching {self.topic} for state={self.target_state}, "
+            f"source={self.source_kind}, enabled={self.enabled}"
         )
 
     def _on_state(self, msg: String) -> None:
@@ -441,6 +728,9 @@ class SonicPicoRuntimeSupervisor(Node):
             self.get_logger().warning(f"invalid state-machine snapshot: {error}")
 
     def _tick(self) -> None:
+        if self.source_kind == "pnlink":
+            return
+        assert self.pipeline is not None
         now = time.monotonic()
         self.desired = self.state_snapshot.active(now)
         was_stopping = self.pipeline.stopping
@@ -461,19 +751,26 @@ class SonicPicoRuntimeSupervisor(Node):
             self.pipeline.request_stop("SONIC state inactive or heartbeat lost")
 
     def destroy_node(self):
-        self.pipeline.close()
+        if self.pipeline is not None:
+            self.pipeline.close()
+        if self.pnlink_runtime is not None:
+            self.pnlink_runtime.close()
         return super().destroy_node()
 
 
 def main(args=None) -> None:
+    if rclpy is None:
+        raise RuntimeError("sonic runtime supervisor requires ROS 2 rclpy")
     rclpy.init(args=args)
-    node = SonicPicoRuntimeSupervisor()
+    node = None
     try:
+        node = SonicPicoRuntimeSupervisor()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        node.destroy_node()
+        if node is not None:
+            node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
 

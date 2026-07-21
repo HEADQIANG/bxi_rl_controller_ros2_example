@@ -20,12 +20,17 @@ from collections import deque
 from std_msgs.msg import Header, String
 from geometry_msgs.msg import Pose
 from sensor_msgs.msg import JointState
+from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
 from ament_index_python.packages import get_package_share_directory
 
 from bxi_example_py_elf3.inference.beyondmimic import *
 from bxi_example_py_elf3.inference.normal import *
 from bxi_example_py_elf3.inference.amp import *
 from bxi_example_py_elf3.inference.sonic import SonicTeleopPolicy
+from bxi_example_py_elf3.sonic_pnlink.diagnostics import (
+    DiagnosticIssue,
+    DiagnosticReporter,
+)
 from bxi_example_py_elf3.utils.hot_reload import HotReloadMixin
 from bxi_example_py_elf3.utils.state_machine import (
     RobotStateMachine,
@@ -117,6 +122,10 @@ class BxiExample(HotReloadMixin, Node):
 
     def __init__(self):
         super().__init__("bxi_example_py")
+        self.sonic_diagnostic_reporter = DiagnosticReporter()
+        self.sonic_diagnostic_pub = self.create_publisher(
+            DiagnosticArray, "/sonic_pnlink/diagnostics", 10
+        )
 
         # 加载运行参数
         self.load_files()
@@ -324,9 +333,34 @@ class BxiExample(HotReloadMixin, Node):
         self.sonic_teleop: SonicTeleopPolicy = SonicTeleopPolicy(
             model_onnx_path=sonic_model_path,
             stream_reference_npz=sonic_stream_reference_path,
+            diagnostic_reporter=self._publish_sonic_diagnostic,
         )
         self.model_file_paths: tuple[str, ...] = tuple(model_file_paths)
         self.pd_pos: np.ndarray = self.normal.default_dof_pos
+
+    def _publish_sonic_diagnostic(self, issue: DiagnosticIssue) -> None:
+        if not self.sonic_diagnostic_reporter.report(issue):
+            return
+        message = DiagnosticArray()
+        message.header.stamp = self.get_clock().now().to_msg()
+        status = DiagnosticStatus()
+        levels = {
+            "OK": DiagnosticStatus.OK,
+            "WARN": DiagnosticStatus.WARN,
+            "ERROR": DiagnosticStatus.ERROR,
+            "STALE": DiagnosticStatus.STALE,
+        }
+        status.level = levels[issue.severity]
+        status.name = f"sonic_pnlink/POLICY_INPUT/policy/{issue.field}"
+        status.hardware_id = "sonic_policy"
+        status.message = issue.code
+        values = self.sonic_diagnostic_reporter.as_dict(issue)
+        status.values = [
+            KeyValue(key=str(key), value=str(value))
+            for key, value in values.items()
+        ]
+        message.status = [status]
+        self.sonic_diagnostic_pub.publish(message)
 
     def bind_robot_states(self, robot_states):
         for state in robot_states.values():

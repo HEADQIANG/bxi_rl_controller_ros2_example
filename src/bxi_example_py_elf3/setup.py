@@ -75,8 +75,12 @@ setup(
             'bxi_example_py_elf3_mjlab = bxi_example_py_elf3.bxi_example_mjlab:main',
             'bxi_example_py_elf3_demo = bxi_example_py_elf3.bxi_example_demo:main',
             'sonic_pico_bridge = bxi_example_py_elf3.sonic_pico.pico_pose_to_smpl_ref_bridge:main',
+            'sonic_pose_to_smpl_ref_bridge = bxi_example_py_elf3.sonic_pico.pico_pose_to_smpl_ref_bridge:main',
             'sonic_pico_manager_legacy = bxi_example_py_elf3.sonic_pico.pico_manager_legacy:main',
             'sonic_pico_runtime_supervisor = bxi_example_py_elf3.sonic_pico.runtime_supervisor:main',
+            'sonic_runtime_supervisor = bxi_example_py_elf3.sonic_pico.runtime_supervisor:main',
+            'sonic_pnlink_pose_source = bxi_example_py_elf3.sonic_pnlink.pose_source:main',
+            'sonic_pnlink_mujoco_viewer = bxi_example_py_elf3.sonic_pnlink.mujoco_viewer:main',
         ],
     },
 )

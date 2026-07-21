@@ -13,12 +13,30 @@ import math
 import os
 import time
 from dataclasses import dataclass
-from typing import Any, Optional
+from typing import Any, Callable, Optional
 from pathlib import Path
 
 import numpy as np
-import onnxruntime as ort
-import zmq
+try:
+    import onnxruntime as ort
+except ImportError:  # pragma: no cover - policy tests replace ONNX initialization
+    ort = None
+try:
+    import zmq
+except ImportError:  # pragma: no cover - policy tests replace ZMQ initialization
+    class _ZmqUnavailable:
+        class Again(Exception):
+            pass
+
+        class ZMQError(Exception):
+            pass
+
+        NOBLOCK = 1
+        POLLIN = 1
+
+    zmq = _ZmqUnavailable()
+
+from bxi_example_py_elf3.sonic_pnlink.diagnostics import DiagnosticIssue
 
 try:
     from ament_index_python.packages import get_package_share_directory
@@ -47,6 +65,7 @@ DTYPE_MAP = {
     "u8": np.dtype("u1"),
     "bool": np.dtype("?"),
 }
+
 
 def _find_package_data_file(relative_path: str) -> str:
     if get_package_share_directory is not None:
@@ -411,6 +430,13 @@ def _as_window(arr: np.ndarray, width: int, name: str) -> np.ndarray:
     )
 
 
+class PolicyInputError(ValueError):
+    def __init__(self, code: str, field: str, message: str):
+        super().__init__(message)
+        self.code = code
+        self.field = field
+
+
 class SonicTeleopPolicy:
     """SONIC _smpl.onnx policy for BXI RobotControlState integration."""
 
@@ -424,7 +450,9 @@ class SonicTeleopPolicy:
         smpl_ref_zmq_topic: Optional[str] = None,
         require_live_reference: Optional[bool] = None,
         yaw_bias_rad: Optional[float] = None,
+        diagnostic_reporter: Optional[Callable[[DiagnosticIssue], None]] = None,
     ):
+        self.diagnostic_reporter = diagnostic_reporter
         self.model_onnx_path = model_onnx_path or os.environ.get(
             "BXI_SONIC_MODEL_ONNX", DEFAULT_MODEL_ONNX
         )
@@ -500,6 +528,8 @@ class SonicTeleopPolicy:
         self._init_zmq()
 
     def _init_onnx(self) -> None:
+        if ort is None:
+            raise RuntimeError("SONIC policy requires onnxruntime")
         providers = ["CUDAExecutionProvider", "CPUExecutionProvider"] if ort.get_device() == "GPU" else ["CPUExecutionProvider"]
         options = ort.SessionOptions()
         options.intra_op_num_threads = 4
@@ -522,6 +552,8 @@ class SonicTeleopPolicy:
         self.zmq_socket = None
         if not self.use_smpl_ref_zmq:
             return
+        if not hasattr(zmq, "Context"):
+            raise RuntimeError("SONIC live references require pyzmq")
         self.zmq_context = zmq.Context()
         self.zmq_socket = self.zmq_context.socket(zmq.SUB)
         self.zmq_socket.setsockopt(zmq.RCVHWM, 1)
@@ -629,7 +661,6 @@ class SonicTeleopPolicy:
                 fields = _decode_packed_message(msg, self.smpl_ref_zmq_topic)
                 if not fields:
                     continue
-                frame = self._frame_from_fields(fields)
             except (
                 IndexError,
                 KeyError,
@@ -638,50 +669,155 @@ class SonicTeleopPolicy:
                 ValueError,
                 json.JSONDecodeError,
                 zmq.Again,
-            ):
+            ) as exc:
+                self._report_policy_diagnostic(
+                    "WIRE_DECODE_FAILURE", "wire", str(exc)
+                )
+                continue
+            try:
+                frame = self._frame_from_fields(fields)
+            except PolicyInputError as exc:
+                self._report_policy_diagnostic(
+                    exc.code,
+                    exc.field,
+                    str(exc),
+                    self._frame_index_from_fields(fields),
+                )
+                continue
+            except (IndexError, KeyError, TypeError, ValueError) as exc:
+                self._report_policy_diagnostic(
+                    "REFERENCE_REJECTED",
+                    "state",
+                    str(exc),
+                    self._frame_index_from_fields(fields),
+                )
                 continue
             self.latest_live_ref = frame
             self.latest_live_ref_time = time.monotonic()
+            self._report_policy_diagnostic(
+                "OK",
+                "state",
+                "reference accepted",
+                frame.frame_index,
+                severity="OK",
+                action="REFERENCE_ACCEPTED",
+            )
         return self.latest_live_ref
+
+    @staticmethod
+    def _frame_index_from_fields(fields: dict[str, np.ndarray]) -> int:
+        frame_index = fields.get("frame_index")
+        if frame_index is None or np.asarray(frame_index).size == 0:
+            return -1
+        try:
+            return int(np.asarray(frame_index).reshape(-1)[-1])
+        except (TypeError, ValueError, IndexError):
+            return -1
+
+    def _report_policy_diagnostic(
+        self,
+        code: str,
+        field: str,
+        observed: str,
+        frame_index: int = -1,
+        *,
+        severity: str = "ERROR",
+        action: str = "REFERENCE_REJECTED",
+    ) -> None:
+        if self.diagnostic_reporter is None:
+            return
+        try:
+            self.diagnostic_reporter(
+                DiagnosticIssue(
+                    "POLICY_INPUT",
+                    code,
+                    field,
+                    action,
+                    frame_index=frame_index,
+                    observed=observed,
+                    severity=severity,
+                )
+            )
+        except Exception:
+            pass
 
     def _frame_from_fields(self, fields: dict[str, np.ndarray]) -> SmplReferenceFrame:
         source_ready = fields.get("source_ready")
         if source_ready is None or not bool(np.asarray(source_ready).reshape(-1)[-1]):
-            raise ValueError("smpl_ref source is not ready")
+            raise PolicyInputError(
+                "REFERENCE_REJECTED", "state", "smpl_ref source is not ready"
+            )
         stream_mode = fields.get("source_stream_mode")
         if stream_mode is not None and int(np.asarray(stream_mode).reshape(-1)[-1]) != 1:
-            raise ValueError("smpl_ref source is not in POSE mode")
+            raise PolicyInputError(
+                "REFERENCE_REJECTED", "state", "smpl_ref source is not in POSE mode"
+            )
         calibration_ready = fields.get("source_calibration_ready")
         if calibration_ready is not None and not bool(
             np.asarray(calibration_ready).reshape(-1)[-1]
         ):
-            raise ValueError("smpl_ref source is not calibrated")
+            raise PolicyInputError(
+                "REFERENCE_REJECTED", "state", "smpl_ref source is not calibrated"
+            )
 
-        frame_index = fields.get("frame_index")
-        if frame_index is None or frame_index.size == 0:
-            index = -1
-        else:
-            index = int(np.asarray(frame_index).reshape(-1)[-1])
+        index = self._frame_index_from_fields(fields)
         anchor = fields.get("anchor_quat")
+        windows: dict[str, np.ndarray] = {}
+        for name, width in (
+            ("term1_local", 72),
+            ("root_quat", 4),
+            ("wrist", 6),
+        ):
+            try:
+                windows[name] = _as_window(fields[name], width, name)
+            except (IndexError, KeyError, TypeError, ValueError) as exc:
+                raise PolicyInputError(
+                    "POLICY_SHAPE_INVALID", "shape", f"{name}: {exc}"
+                ) from exc
+        try:
+            anchor_window = (
+                _as_window(anchor, 4, "anchor_quat")
+                if anchor is not None
+                else None
+            )
+        except (IndexError, TypeError, ValueError) as exc:
+            raise PolicyInputError(
+                "POLICY_SHAPE_INVALID", "shape", f"anchor_quat: {exc}"
+            ) from exc
         frame = SmplReferenceFrame(
-            term1_local=_as_window(fields["term1_local"], 72, "term1_local"),
-            root_quat=_as_window(fields["root_quat"], 4, "root_quat"),
-            wrist=_as_window(fields["wrist"], 6, "wrist"),
-            anchor_quat=_as_window(anchor, 4, "anchor_quat") if anchor is not None else None,
+            term1_local=windows["term1_local"],
+            root_quat=windows["root_quat"],
+            wrist=windows["wrist"],
+            anchor_quat=anchor_window,
             frame_index=index,
             sequence=self.live_sequence + 1,
         )
-        arrays = [frame.term1_local, frame.root_quat, frame.wrist]
-        if frame.anchor_quat is not None:
-            arrays.append(frame.anchor_quat)
-        if not all(np.isfinite(array).all() for array in arrays):
-            raise ValueError("smpl_ref contains non-finite values")
+        if not np.isfinite(frame.term1_local).all():
+            raise PolicyInputError(
+                "POLICY_NONFINITE", "position", "term1_local contains non-finite values"
+            )
+        if not np.isfinite(frame.root_quat).all():
+            raise PolicyInputError(
+                "POLICY_NONFINITE", "rotation", "root_quat contains non-finite values"
+            )
+        if not np.isfinite(frame.wrist).all():
+            raise PolicyInputError(
+                "POLICY_NONFINITE", "rotation", "wrist contains non-finite values"
+            )
+        if frame.anchor_quat is not None and not np.isfinite(frame.anchor_quat).all():
+            raise PolicyInputError(
+                "POLICY_NONFINITE", "rotation", "anchor_quat contains non-finite values"
+            )
         if np.any(np.linalg.norm(frame.root_quat, axis=1) <= 1.0e-6):
-            raise ValueError("smpl_ref contains an invalid root quaternion")
+            raise PolicyInputError(
+                "POLICY_ROOT_INVALID", "rotation", "invalid root quaternion"
+            )
         if frame.anchor_quat is not None and np.any(
             np.linalg.norm(frame.anchor_quat, axis=1) <= 1.0e-6
         ):
-            raise ValueError("smpl_ref contains an invalid anchor quaternion")
+            raise PolicyInputError(
+                "POLICY_ROOT_INVALID", "rotation", "invalid anchor quaternion"
+            )
         self.live_sequence += 1
         return frame
 

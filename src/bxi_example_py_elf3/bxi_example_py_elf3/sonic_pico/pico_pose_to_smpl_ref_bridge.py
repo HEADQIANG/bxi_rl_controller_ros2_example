@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Bridge official PICO manager ``pose`` stream to ELF3 ``smpl_ref`` stream.
+"""Bridge a normalized PICO or PN-Link ``pose`` stream to ELF3 ``smpl_ref``.
 
 The official ``gear_sonic/scripts/pico_manager_thread_server.py --manager`` sends
 packed ZMQ messages on topic ``pose``.  For the ELF3 native _smpl.onnx deploy we
@@ -9,9 +9,9 @@ publish the same long-lived reference contract used by ``smpl_ref_bridge.py``:
     root_quat   : float32 [10,4]    SMPL root quaternion, wxyz
     wrist       : float32 [10,6]    ELF3 native wrist x/y/z, left then right
 
-The bridge is intentionally only an adapter: PICO/SMPL normalization stays in
-the official PICO manager, while the downstream SONIC policy consumes the
-normalized reference tensors.  Live PICO chunks are merged with the same
+The bridge is intentionally only an adapter: source-side SMPL normalization
+stays in the PICO manager or PN-Link source, while the downstream SONIC policy
+consumes the normalized reference tensors. Live chunks are merged with the same
 sliding-window semantics as the official C++ StreamedMotionMerger, so the
 published 10-frame smpl_ref window is a true future window instead of a tiled
 latest frame.
@@ -29,17 +29,28 @@ import time
 from typing import Any
 
 import numpy as np
-import zmq
+try:
+    import zmq
+except ImportError:  # pragma: no cover - pure parsing tests do not need ZMQ
+    zmq = None
 
 try:
     import rclpy
     from rclpy.signals import SignalHandlerOptions
+    from diagnostic_msgs.msg import DiagnosticArray, DiagnosticStatus, KeyValue
     from std_msgs.msg import Float32
 except Exception:  # pragma: no cover - allows non-ROS source-tree tooling
     rclpy = None
     SignalHandlerOptions = None
+    DiagnosticArray = None
+    DiagnosticStatus = None
+    KeyValue = None
     Float32 = None
 
+from bxi_example_py_elf3.sonic_pnlink.diagnostics import (
+    DiagnosticIssue,
+    DiagnosticReporter,
+)
 from bxi_example_py_elf3.sonic_pico.zmq_messages import pack_pose_message
 
 
@@ -72,6 +83,19 @@ PICO_BUTTON_FIELDS = (
     "left_grip",
     "right_grip",
 )
+
+
+def _ros_diagnostic_level(level: int | None, status_type=None):
+    """Return a level constant with the representation expected by ROS."""
+    if status_type is None:
+        status_type = DiagnosticStatus
+    levels = {
+        0: status_type.OK,
+        1: status_type.WARN,
+        2: status_type.ERROR,
+        3: status_type.STALE,
+    }
+    return levels.get(level, status_type.ERROR)
 
 
 def _field_scalar(fields: dict[str, np.ndarray], name: str) -> float | None:
@@ -134,15 +158,94 @@ class PicoButtonRosPublisher:
             rclpy.shutdown(uninstall_handlers=False)
 
 
+class BridgeDiagnosticRosPublisher:
+    def __init__(self, enabled: bool = True):
+        self.enabled = False
+        self.node = None
+        self.publisher = None
+        self._owns_rclpy = False
+        self.reporter = DiagnosticReporter()
+        if not enabled:
+            return
+        if any(value is None for value in (rclpy, DiagnosticArray, DiagnosticStatus, KeyValue)):
+            print(
+                "[pose->smpl_ref] WARN diagnostic_msgs unavailable; "
+                "bridge diagnostics disabled",
+                flush=True,
+            )
+            return
+        if not rclpy.ok():
+            init_kwargs = {"args": []}
+            if SignalHandlerOptions is not None:
+                init_kwargs["signal_handler_options"] = SignalHandlerOptions.NO
+            rclpy.init(**init_kwargs)
+            self._owns_rclpy = True
+        self.node = rclpy.create_node("sonic_pose_to_smpl_ref_diagnostics")
+        self.publisher = self.node.create_publisher(
+            DiagnosticArray, "/sonic_pnlink/diagnostics", 10
+        )
+        self.enabled = True
+
+    def report(
+        self,
+        code: str,
+        field: str,
+        action: str,
+        observed: str = "",
+        frame_index: int = -1,
+        level: int | None = None,
+    ) -> None:
+        severity = {
+            0: "OK",
+            1: "WARN",
+            2: "ERROR",
+            3: "STALE",
+        }.get(level, "ERROR")
+        issue = DiagnosticIssue(
+            stage="SMPL_REF_BRIDGE",
+            code=code,
+            field=field,
+            action=action,
+            frame_index=frame_index,
+            observed=observed,
+            severity=severity,
+        )
+        if not self.reporter.report(issue) or not self.enabled:
+            return
+        message = DiagnosticArray()
+        message.header.stamp = self.node.get_clock().now().to_msg()
+        status = DiagnosticStatus()
+        status.level = _ros_diagnostic_level(level)
+        status.name = f"sonic_pnlink/SMPL_REF_BRIDGE/bridge/{field}"
+        status.hardware_id = "pose_bridge"
+        status.message = code
+        values = self.reporter.as_dict(issue)
+        status.values = [
+            KeyValue(key=str(key), value=str(value))
+            for key, value in values.items()
+        ]
+        message.status = [status]
+        self.publisher.publish(message)
+        rclpy.spin_once(self.node, timeout_sec=0.0)
+
+    def close(self) -> None:
+        if self.node is not None:
+            self.node.destroy_node()
+            self.node = None
+        if self._owns_rclpy and rclpy is not None and rclpy.ok():
+            rclpy.shutdown(uninstall_handlers=False)
+
+
 def _install_stop_signal_handlers(
     stop_event: threading.Event,
+    log_prefix: str = "[pico->smpl_ref]",
 ) -> dict[signal.Signals, Any]:
     previous_handlers: dict[signal.Signals, Any] = {}
 
     def _request_stop(signum, _frame) -> None:
         if not stop_event.is_set():
             signal_name = signal.Signals(signum).name
-            print(f"\n[pico->smpl_ref] received {signal_name}; stopping", flush=True)
+            print(f"\n{log_prefix} received {signal_name}; stopping", flush=True)
         stop_event.set()
 
     for signum in (signal.SIGINT, signal.SIGTERM):
@@ -171,11 +274,18 @@ class MergeResult:
     frame_step: int = 1
 
 
-class PicoSourceReadinessGate:
+class PoseSourceReadinessGate:
     """Require calibrated POSE metadata and progressing, finite raw frames."""
 
-    def __init__(self, required_consecutive: int = READY_CONSECUTIVE_MESSAGES):
+    def __init__(
+        self,
+        required_consecutive: int = READY_CONSECUTIVE_MESSAGES,
+        source_kind: str = "pico",
+    ):
+        if source_kind not in ("pico", "pnlink"):
+            raise ValueError(f"unknown pose source kind: {source_kind}")
         self.required_consecutive = max(1, int(required_consecutive))
+        self.source_kind = source_kind
         self.reset()
 
     def reset(self) -> None:
@@ -204,10 +314,15 @@ class PicoSourceReadinessGate:
                 np.asarray(fields["calibration_ready"]).reshape(-1)[-1]
             )
             frame_index = int(np.asarray(fields["frame_index"]).reshape(-1)[-1])
+            finite_fields = ["smpl_joints", "body_quat_w"]
+            if self.source_kind == "pnlink":
+                finite_fields.append("wrist")
+            else:
+                finite_fields.append("joint_pos")
             finite = all(
                 np.asarray(fields[name]).size > 0
                 and np.isfinite(np.asarray(fields[name])).all()
-                for name in ("smpl_joints", "body_quat_w", "joint_pos")
+                for name in finite_fields
             )
         except (KeyError, TypeError, ValueError, IndexError):
             mode, calibrated, finite = -1, False, False
@@ -255,6 +370,10 @@ class PicoSourceReadinessGate:
             and self.last_ready_mono is not None
             and now_mono - self.last_ready_mono <= stale_seconds
         )
+
+
+# Compatibility import for existing deployments and tests.
+PicoSourceReadinessGate = PoseSourceReadinessGate
 
 
 def _decode_packed_message(msg: bytes, topic: str) -> dict[str, np.ndarray] | None:
@@ -316,14 +435,25 @@ def _extract_wrist_frames(joint_pos: np.ndarray, source: str) -> np.ndarray:
     return np.ascontiguousarray(jp[:, idx], dtype=np.float32)
 
 
-def _parse_incoming_chunk(fields: dict[str, np.ndarray], wrist_source: str) -> IncomingChunk:
+def _parse_incoming_chunk(
+    fields: dict[str, np.ndarray],
+    wrist_source: str,
+    source_kind: str = "pico",
+) -> IncomingChunk:
+    if source_kind not in ("pico", "pnlink"):
+        raise ValueError(f"unknown pose source kind: {source_kind}")
+    required_fields = ["frame_index", "smpl_joints", "body_quat_w"]
+    if source_kind == "pnlink":
+        required_fields.append("wrist")
+    elif "wrist" not in fields:
+        required_fields.append("joint_pos")
     missing = [
         k
-        for k in ("frame_index", "smpl_joints", "body_quat_w", "joint_pos")
+        for k in required_fields
         if k not in fields
     ]
     if missing:
-        raise ValueError(f"PICO pose message missing required fields: {missing}")
+        raise ValueError(f"{source_kind} pose message missing required fields: {missing}")
 
     smpl_joints = np.asarray(fields["smpl_joints"], dtype=np.float32)
     if smpl_joints.ndim == 2 and smpl_joints.shape[1] == 72:
@@ -338,18 +468,21 @@ def _parse_incoming_chunk(fields: dict[str, np.ndarray], wrist_source: str) -> I
         raise ValueError(f"smpl_joints has shape {smpl_joints.shape}; expected (N,24,3)")
 
     root_quat = _as_frame_matrix(fields["body_quat_w"], 4, "body_quat_w")
-    wrist = _extract_wrist_frames(fields["joint_pos"], wrist_source)
+    if "wrist" in fields:
+        wrist = _as_frame_matrix(fields["wrist"], 6, "wrist")
+    else:
+        wrist = _extract_wrist_frames(fields["joint_pos"], wrist_source)
     frame_indices = np.asarray(fields["frame_index"], dtype=np.int64).reshape(-1)
 
     n = term1.shape[0]
     if root_quat.shape[0] != n or wrist.shape[0] != n or frame_indices.shape[0] != n:
         raise ValueError(
-            "PICO pose frame count mismatch: "
+            f"{source_kind} pose frame count mismatch: "
             f"frame_index={frame_indices.shape[0]} term1={term1.shape[0]} "
             f"root={root_quat.shape[0]} wrist={wrist.shape[0]}"
         )
     if n <= 0:
-        raise ValueError("PICO pose message has zero frames")
+        raise ValueError(f"{source_kind} pose message has zero frames")
     if n > 1 and np.any(np.diff(frame_indices) <= 0):
         raise ValueError(f"frame_index must be strictly increasing: {frame_indices.tolist()}")
 
@@ -362,7 +495,7 @@ def _parse_incoming_chunk(fields: dict[str, np.ndarray], wrist_source: str) -> I
 
 
 class StreamedSmplRefMerger:
-    """Python port of C++ StreamedMotionMerger for live PICO SMPL refs."""
+    """Python port of C++ StreamedMotionMerger for live SMPL references."""
 
     def __init__(
         self,
@@ -524,7 +657,7 @@ class StreamedSmplRefMerger:
 
 
 def _build_live_smpl_ref_if_ready(
-    source_gate: PicoSourceReadinessGate,
+    source_gate: PoseSourceReadinessGate,
     merger: StreamedSmplRefMerger,
     now_mono: float,
     stale_seconds: float,
@@ -546,15 +679,30 @@ def _build_live_smpl_ref_if_ready(
     return smpl_ref
 
 
-def main() -> int:
+def _build_argument_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser()
-    parser.add_argument("--pico-host", default="127.0.0.1")
+    parser.add_argument(
+        "--source-kind",
+        choices=("pico", "pnlink"),
+        default="pico",
+    )
+    parser.add_argument(
+        "--pico-host",
+        "--pose-host",
+        dest="pose_host",
+        default="127.0.0.1",
+    )
     parser.add_argument("--pico-port", type=int, default=5556)
     parser.add_argument("--pico-topic", default="pose")
     parser.add_argument("--out-host", default="127.0.0.1")
     parser.add_argument("--out-port", type=int, default=5557)
     parser.add_argument("--out-topic", default="smpl_ref")
-    parser.add_argument("--rate", type=float, default=DEFAULT_RATE_HZ, help="fixed smpl_ref publish rate in Hz")
+    parser.add_argument(
+        "--rate",
+        type=float,
+        default=DEFAULT_RATE_HZ,
+        help="fixed smpl_ref publish rate in Hz",
+    )
     parser.add_argument("--history-frames", type=int, default=HISTORY_FRAMES)
     parser.add_argument("--max-gap-frames", type=int, default=MAX_GAP_FRAMES)
     parser.add_argument("--disable-catch-up", action="store_true")
@@ -571,18 +719,33 @@ def main() -> int:
         help="do not republish PICO trigger/grip fields as ROS Float32 topics",
     )
     parser.add_argument(
+        "--disable-ros-diagnostics",
+        action="store_true",
+        help="do not publish bridge diagnostics through ROS 2",
+    )
+    parser.add_argument(
         "--stale-warning-seconds",
         type=float,
         default=0.2,
         help="stop live output when raw calibrated POSE is stale for this many seconds",
     )
-    args = parser.parse_args()
+    return parser
+
+
+def main() -> int:
+    if zmq is None:
+        raise RuntimeError("sonic_pose_to_smpl_ref_bridge requires pyzmq")
+    args = _build_argument_parser().parse_args()
+    log_prefix = f"[{args.source_kind}->smpl_ref]"
 
     stop_event = threading.Event()
-    previous_signal_handlers = _install_stop_signal_handlers(stop_event)
+    previous_signal_handlers = _install_stop_signal_handlers(stop_event, log_prefix)
 
     button_pub = PicoButtonRosPublisher(
-        enabled=not args.disable_ros_pico_topics
+        enabled=args.source_kind == "pico" and not args.disable_ros_pico_topics
+    )
+    diagnostic_pub = BridgeDiagnosticRosPublisher(
+        enabled=not args.disable_ros_diagnostics
     )
 
     ctx = zmq.Context()
@@ -590,7 +753,7 @@ def main() -> int:
     sub.setsockopt(zmq.LINGER, 0)
     sub.setsockopt(zmq.RCVHWM, 1)
     sub.setsockopt_string(zmq.SUBSCRIBE, args.pico_topic)
-    sub.connect(f"tcp://{args.pico_host}:{args.pico_port}")
+    sub.connect(f"tcp://{args.pose_host}:{args.pico_port}")
 
     pub = ctx.socket(zmq.PUB)
     pub.setsockopt(zmq.LINGER, 0)
@@ -598,14 +761,16 @@ def main() -> int:
     pub.bind(f"tcp://{args.out_host}:{args.out_port}")
 
     print(
-        f"[pico->smpl_ref] SUB tcp://{args.pico_host}:{args.pico_port} topic='{args.pico_topic}'"
+        f"{log_prefix} SUB tcp://{args.pose_host}:{args.pico_port} "
+        f"topic='{args.pico_topic}'"
     )
     print(
-        f"[pico->smpl_ref] PUB tcp://{args.out_host}:{args.out_port} topic='{args.out_topic}' "
+        f"{log_prefix} PUB tcp://{args.out_host}:{args.out_port} "
+        f"topic='{args.out_topic}' "
         f"wrist_source={args.wrist_source}"
     )
     print(
-        "[pico->smpl_ref] merger enabled "
+        f"{log_prefix} merger enabled "
         f"rate={args.rate}Hz history={args.history_frames} "
         f"max_gap={args.max_gap_frames} catch_up={not args.disable_catch_up}",
         flush=True,
@@ -618,7 +783,7 @@ def main() -> int:
         max_gap_frames=args.max_gap_frames,
         catch_up_enabled=not args.disable_catch_up,
     )
-    source_gate = PicoSourceReadinessGate()
+    source_gate = PoseSourceReadinessGate(source_kind=args.source_kind)
     period = 1.0 / args.rate
     next_tick = time.monotonic()
     last_log = 0.0
@@ -640,7 +805,22 @@ def main() -> int:
                         msg = sub.recv(flags=zmq.NOBLOCK)
                     except zmq.Again:
                         break
-                    fields = _decode_packed_message(msg, args.pico_topic)
+                    try:
+                        fields = _decode_packed_message(msg, args.pico_topic)
+                    except Exception as exc:
+                        skipped += 1
+                        source_gate.reset()
+                        diagnostic_pub.report(
+                            "WIRE_DECODE_FAILURE",
+                            "wire",
+                            "FRAME_DROPPED",
+                            observed=str(exc),
+                        )
+                        print(
+                            f"{log_prefix} skipped undecodable pose: {exc}",
+                            flush=True,
+                        )
+                        continue
                     if fields is not None:
                         button_pub.publish(fields)
                         received_mono = time.monotonic()
@@ -652,6 +832,13 @@ def main() -> int:
                             pending_fields = fields
                         else:
                             pending_fields = None
+                            diagnostic_pub.report(
+                                "SOURCE_NOT_READY",
+                                "state",
+                                "LIVE_REVOKED",
+                                observed=f"source_kind={args.source_kind}",
+                                level=1,
+                            )
                         last_received_mono = received_mono
                         stale_was_reported = False
                         received += 1
@@ -664,11 +851,25 @@ def main() -> int:
             )
             if pending_fields is not None and source_fresh:
                 try:
-                    merger.merge(_parse_incoming_chunk(pending_fields, args.wrist_source))
+                    chunk = _parse_incoming_chunk(
+                        pending_fields,
+                        args.wrist_source,
+                        source_kind=args.source_kind,
+                    )
+                    merger.merge(chunk)
                 except Exception as exc:
                     skipped += 1
                     source_gate.reset()
-                    print(f"[pico->smpl_ref] skipped invalid PICO pose: {exc}", flush=True)
+                    diagnostic_pub.report(
+                        "MERGE_INVALID",
+                        "shape",
+                        "LIVE_REVOKED",
+                        observed=str(exc),
+                    )
+                    print(
+                        f"{log_prefix} skipped invalid {args.source_kind} pose: {exc}",
+                        flush=True,
+                    )
                 pending_fields = None
 
             smpl_ref = _build_live_smpl_ref_if_ready(
@@ -680,6 +881,13 @@ def main() -> int:
             if smpl_ref is not None:
                 pub.send(pack_pose_message(smpl_ref, topic=args.out_topic, version=4))
                 sent += 1
+                diagnostic_pub.report(
+                    "OK",
+                    "state",
+                    "REFERENCE_ACCEPTED",
+                    frame_index=int(smpl_ref["frame_index"][0]),
+                    level=0,
+                )
 
             tick_now = time.monotonic()
             input_age = (
@@ -697,23 +905,30 @@ def main() -> int:
                 and not stale_was_reported
             ):
                 print(
-                    "[pico->smpl_ref] WARN PICO pose input stale; "
+                    f"{log_prefix} WARN {args.source_kind} pose input stale; "
                     f"age_ms={input_age * 1000.0:.0f} received={received}. "
                     "Live smpl_ref publication is stopped; policy uses idle_left.",
                     flush=True,
+                )
+                diagnostic_pub.report(
+                    "SOURCE_STALE",
+                    "timestamp",
+                    "LIVE_REVOKED",
+                    observed=f"age_seconds={input_age:.3f}",
+                    level=3,
                 )
                 stale_was_reported = True
 
             if now - last_log >= args.log_every:
                 if smpl_ref is None:
                     print(
-                        "[pico->smpl_ref] waiting for calibrated, fresh POSE frames "
+                        f"{log_prefix} waiting for calibrated, fresh POSE frames "
                         f"received={received} skipped={skipped}",
                         flush=True,
                     )
                 else:
                     print(
-                        "[pico->smpl_ref] sent "
+                        f"{log_prefix} sent "
                         f"{sent} received={received} skipped={skipped} "
                         f"frame={int(smpl_ref['frame_index'][0])} "
                         f"input_age_ms={input_age * 1000.0:.0f} "
@@ -729,8 +944,9 @@ def main() -> int:
         stop_event.set()
     finally:
         cleanup_steps = (
+            ("bridge diagnostics publisher", diagnostic_pub.close),
             ("ROS button publisher", button_pub.close),
-            ("PICO subscriber", lambda: sub.close(linger=0)),
+            ("pose subscriber", lambda: sub.close(linger=0)),
             ("smpl_ref publisher", lambda: pub.close(linger=0)),
             ("ZMQ context", ctx.term),
         )
@@ -739,11 +955,11 @@ def main() -> int:
                 close_resource()
             except Exception as exc:
                 print(
-                    f"[pico->smpl_ref] WARN failed to close {resource_name}: {exc}",
+                    f"{log_prefix} WARN failed to close {resource_name}: {exc}",
                     flush=True,
                 )
         _restore_signal_handlers(previous_signal_handlers)
-        print("[pico->smpl_ref] shutdown complete", flush=True)
+        print(f"{log_prefix} shutdown complete", flush=True)
     return 0
 
 

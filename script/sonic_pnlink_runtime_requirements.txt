@@ -1,0 +1,8 @@
+# Pure-Python PN-Link source, bridge, diagnostics, and MuJoCo viewer runtime.
+numpy>=1.26,<2
+scipy>=1.10
+pyzmq>=25
+torch>=2.1
+mujoco>=3.1,<4
+docutils>=0.18
+PyYAML>=6

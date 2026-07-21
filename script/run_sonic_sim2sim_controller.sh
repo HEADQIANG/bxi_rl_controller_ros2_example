@@ -6,15 +6,22 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BXI_RUNTIME_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 export ROS_DOMAIN_ID="${ROS_DOMAIN_ID:-91}"
 
-source /opt/ros/humble/setup.bash
-if [[ -f /opt/bxi/bxi_ros2_pkg-main/setup.bash ]]; then
-  source /opt/bxi/bxi_ros2_pkg-main/setup.bash
-elif [[ -f /opt/bxi/bxi_ros2_pkg/setup.bash ]]; then
-  source /opt/bxi/bxi_ros2_pkg/setup.bash
+if [[ -f "${BXI_RUNTIME_ROOT}/.local_install/setup.bash" && \
+      -f "${BXI_RUNTIME_ROOT}/.local_deps/bxi_ros2_pkg/setup.bash" ]]; then
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/setup_sonic_local_env.sh"
+else
+  source /opt/ros/humble/setup.bash
+  if [[ -f /opt/bxi/bxi_ros2_pkg-main/setup.bash ]]; then
+    source /opt/bxi/bxi_ros2_pkg-main/setup.bash
+  elif [[ -f /opt/bxi/bxi_ros2_pkg/setup.bash ]]; then
+    source /opt/bxi/bxi_ros2_pkg/setup.bash
+  fi
+  source "${BXI_RUNTIME_ROOT}/install/setup.bash"
 fi
-source "${BXI_RUNTIME_ROOT}/install/setup.bash"
 
-DEFAULT_REMOTE_CONFIG="${BXI_RUNTIME_ROOT}/install/share/remote_controller/config/xbox_default.yaml"
+REMOTE_CONTROLLER_PREFIX="$(ros2 pkg prefix remote_controller)"
+DEFAULT_REMOTE_CONFIG="${REMOTE_CONTROLLER_PREFIX}/share/remote_controller/config/xbox_default.yaml"
 if [[ ! -f "${DEFAULT_REMOTE_CONFIG}" ]]; then
   DEFAULT_REMOTE_CONFIG="${BXI_RUNTIME_ROOT}/src/remote_controller/config/xbox_default.yaml"
 fi

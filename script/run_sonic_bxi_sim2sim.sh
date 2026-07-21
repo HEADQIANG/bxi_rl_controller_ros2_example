@@ -11,13 +11,19 @@ if [[ -x "${BXI_RUNTIME_ROOT}/.venv_teleop/bin/python" ]]; then
   export SONIC_PICO_PYTHON="${SONIC_PICO_PYTHON:-${BXI_RUNTIME_ROOT}/.venv_teleop/bin/python}"
 fi
 
-source /opt/ros/humble/setup.bash
-if [[ -f /opt/bxi/bxi_ros2_pkg-main/setup.bash ]]; then
-  source /opt/bxi/bxi_ros2_pkg-main/setup.bash
-elif [[ -f /opt/bxi/bxi_ros2_pkg/setup.bash ]]; then
-  source /opt/bxi/bxi_ros2_pkg/setup.bash
+if [[ -f "${BXI_RUNTIME_ROOT}/.local_install/setup.bash" && \
+      -f "${BXI_RUNTIME_ROOT}/.local_deps/bxi_ros2_pkg/setup.bash" ]]; then
+  # shellcheck disable=SC1091
+  source "${SCRIPT_DIR}/setup_sonic_local_env.sh"
+else
+  source /opt/ros/humble/setup.bash
+  if [[ -f /opt/bxi/bxi_ros2_pkg-main/setup.bash ]]; then
+    source /opt/bxi/bxi_ros2_pkg-main/setup.bash
+  elif [[ -f /opt/bxi/bxi_ros2_pkg/setup.bash ]]; then
+    source /opt/bxi/bxi_ros2_pkg/setup.bash
+  fi
+  source "${BXI_RUNTIME_ROOT}/install/setup.bash"
 fi
-source "${BXI_RUNTIME_ROOT}/install/setup.bash"
 
 export ROS_LOG_DIR="${ROS_LOG_DIR:-/tmp/elf3_bxi_sonic_sim2sim_ros_log}"
 if [[ "${BXI_SIM2SIM_KEEP_PYTHONNOUSERSITE:-0}" != "1" ]]; then

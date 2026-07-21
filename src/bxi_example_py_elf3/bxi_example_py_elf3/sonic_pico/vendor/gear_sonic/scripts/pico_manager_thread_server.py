@@ -28,6 +28,7 @@ from enum import Enum, IntEnum
 import os
 from pathlib import Path
 import signal
+import socket
 import subprocess
 import threading
 import time
@@ -102,6 +103,9 @@ except ImportError:
 
 XRT_SERVICE_SCRIPT = "/opt/apps/roboticsservice/runService.sh"
 XRT_SERVICE_EXECUTABLE = str(Path(XRT_SERVICE_SCRIPT).with_name("RoboticsServiceProcess"))
+XRT_SERVICE_SINGLETON_SOCKET = Path("/tmp/RoboticsServiceProcess_Single_Name")
+XRT_SERVICE_GRPC_HOST = "127.0.0.1"
+XRT_SERVICE_GRPC_PORT = 60061
 XRT_SERVICE_STOP_TIMEOUT_SECONDS = 3.0
 
 
@@ -150,10 +154,77 @@ def _xrt_service_environment(service_dir: Path) -> dict[str, str]:
     return env
 
 
-def _start_xrt_service(prefix: str) -> subprocess.Popen:
+def _xrt_singleton_socket_is_live(
+    socket_path: Path = XRT_SERVICE_SINGLETON_SOCKET,
+) -> bool:
+    """Return whether the Qt local-server socket has a responsive owner."""
+    if not socket_path.exists():
+        return False
+
+    client = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+    client.settimeout(0.2)
+    try:
+        client.connect(str(socket_path))
+        return True
+    except (ConnectionRefusedError, FileNotFoundError):
+        return False
+    except OSError:
+        # Permission and transient errors do not prove that the socket is stale.
+        return True
+    finally:
+        client.close()
+
+
+def _xrt_service_port_is_live(
+    host: str = XRT_SERVICE_GRPC_HOST,
+    port: int = XRT_SERVICE_GRPC_PORT,
+) -> bool:
+    """Return whether a separately managed RoboticsService gRPC port is live."""
+    try:
+        connection = socket.create_connection((host, port), timeout=0.2)
+    except OSError:
+        return False
+    connection.close()
+    return True
+
+
+def _reuse_or_remove_xrt_singleton(prefix: str) -> bool:
+    """Reuse a live service, or remove its stale Qt singleton socket."""
+    if _xrt_service_port_is_live():
+        _startup_log(
+            prefix,
+            f"Using separately managed roboticsservice on "
+            f"{XRT_SERVICE_GRPC_HOST}:{XRT_SERVICE_GRPC_PORT}",
+        )
+        return True
+
+    socket_path = XRT_SERVICE_SINGLETON_SOCKET
+    if not socket_path.exists():
+        return False
+    if _xrt_singleton_socket_is_live(socket_path):
+        _startup_log(prefix, "Using separately managed roboticsservice")
+        return True
+
+    try:
+        socket_path.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise RuntimeError(
+            f"Cannot remove stale roboticsservice socket {socket_path}: {exc}"
+        ) from exc
+    else:
+        _startup_log(prefix, f"Removed stale roboticsservice socket: {socket_path}")
+    return False
+
+
+def _start_xrt_service(prefix: str) -> subprocess.Popen | None:
     service_executable = Path(XRT_SERVICE_EXECUTABLE)
     if not service_executable.is_file() or not os.access(service_executable, os.X_OK):
         raise FileNotFoundError(f"XRT service executable is not runnable: {service_executable}")
+
+    if _reuse_or_remove_xrt_singleton(prefix):
+        return None
 
     service_dir = service_executable.parent
     _startup_log(prefix, f"Starting roboticsservice directly: {service_executable}")
@@ -165,9 +236,12 @@ def _start_xrt_service(prefix: str) -> subprocess.Popen:
     time.sleep(0.2)
     return_code = service_proc.poll()
     if return_code is not None:
+        if _xrt_service_port_is_live() or _xrt_singleton_socket_is_live():
+            _startup_log(prefix, "Using roboticsservice started by another owner")
+            return None
         raise RuntimeError(
             "RoboticsServiceProcess exited during startup "
-            f"with code {return_code}. A stale or separately managed instance may already be running."
+            f"with code {return_code}, and no responsive existing instance was found."
         )
     _startup_log(prefix, f"roboticsservice pid={service_proc.pid}")
     return service_proc

@@ -4,9 +4,10 @@ from dataclasses import dataclass, field
 
 import numpy as np
 import pytest
-import zmq
 
 from bxi_example_py_elf3.inference import sonic
+
+zmq = sonic.zmq
 
 
 IDLE_FRAME_START = 3509
@@ -151,6 +152,7 @@ def policy_harness(tmp_path, monkeypatch):
     clock = FakeClock()
     session = RecordingOnnxSession()
     wire = FakeWire()
+    diagnostics = []
 
     def init_onnx(policy) -> None:
         policy.session = session
@@ -174,7 +176,9 @@ def policy_harness(tmp_path, monkeypatch):
         model_onnx_path="mock.onnx",
         stream_reference_npz=str(reference_path),
         use_smpl_ref_zmq=True,
+        diagnostic_reporter=diagnostics.append,
     )
+    policy.test_diagnostics = diagnostics
     policy.live_ref_timeout_s = 0.5
     policy.source_blend_duration_s = 0.4
 
@@ -185,7 +189,7 @@ def policy_harness(tmp_path, monkeypatch):
 
 def _assert_idle_reference_input(model_input: np.ndarray, term1: np.ndarray) -> None:
     expected = term1[
-        IDLE_FRAME_START : IDLE_FRAME_START + sonic.WINDOW
+        IDLE_FRAME_START:IDLE_FRAME_START + sonic.WINDOW
     ].reshape(-1)
     np.testing.assert_array_equal(model_input[0, :720], expected)
 
@@ -222,6 +226,60 @@ def test_source_ready_false_is_rejected_and_policy_stays_on_idle(policy_harness)
     assert policy.reference_source == "idle"
     assert policy.last_status == "idle_reference"
     _assert_idle_reference_input(session.calls[-1], term1)
+
+
+def test_policy_reports_field_specific_nonfinite_root(policy_harness):
+    policy, _, wire, _, _ = policy_harness
+    fields = _live_fields(2.0)
+    fields["root_quat"][0, 0] = np.nan
+    wire.push(policy.zmq_socket, fields)
+
+    policy.inference_step(*_robot_observation())
+
+    issue = policy.test_diagnostics[-1]
+    assert issue.stage == "POLICY_INPUT"
+    assert issue.code == "POLICY_NONFINITE"
+    assert issue.field == "rotation"
+    assert policy.latest_live_ref is None
+
+
+def test_policy_rejects_zero_root_quaternion_with_stable_code(policy_harness):
+    policy, _, wire, _, _ = policy_harness
+    fields = _live_fields(2.5)
+    fields["root_quat"][:] = 0.0
+    wire.push(policy.zmq_socket, fields)
+
+    policy.inference_step(*_robot_observation())
+
+    issue = policy.test_diagnostics[-1]
+    assert issue.code == "POLICY_ROOT_INVALID"
+    assert issue.field == "rotation"
+
+
+def test_policy_reports_shape_error_and_keeps_idle_fallback(policy_harness):
+    policy, _, wire, _, _ = policy_harness
+    fields = _live_fields(3.0)
+    fields["term1_local"] = np.zeros((sonic.WINDOW, 71), dtype=np.float32)
+    wire.push(policy.zmq_socket, fields)
+
+    policy.inference_step(*_robot_observation())
+
+    issue = policy.test_diagnostics[-1]
+    assert issue.code == "POLICY_SHAPE_INVALID"
+    assert issue.field == "shape"
+    assert policy.last_status == "idle_reference"
+
+
+def test_policy_diagnostic_callback_failure_is_isolated(policy_harness):
+    policy, _, wire, _, _ = policy_harness
+    policy.diagnostic_reporter = lambda _issue: (_ for _ in ()).throw(
+        RuntimeError("diagnostic publisher failed")
+    )
+    wire.push(policy.zmq_socket, _live_fields(4.0, source_ready=False))
+
+    policy.inference_step(*_robot_observation())
+
+    assert policy.last_status == "idle_reference"
 
 
 def test_ready_live_reference_switches_and_blends_over_point_four_seconds(

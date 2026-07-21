@@ -7,8 +7,12 @@ import pytest
 from bxi_example_py_elf3.sonic_pico import runtime_supervisor
 from bxi_example_py_elf3.sonic_pico.runtime_supervisor import (
     ChildProcess,
+    PnLinkPauseRequest,
+    PnLinkRuntime,
     PicoPipeline,
     StateSnapshotMonitor,
+    default_pnlink_python_executable,
+    pnlink_ready_paused,
     prepend_existing_ld_paths,
 )
 
@@ -91,6 +95,9 @@ class FakeLogger:
         self.messages.append(message)
 
     def error(self, message):
+        self.messages.append(message)
+
+    def warning(self, message):
         self.messages.append(message)
 
 
@@ -344,3 +351,216 @@ def test_pico_manager_cuda_is_explicit_opt_in(monkeypatch):
 
     manager_command = popen_calls[0][0]
     assert "--cuda" in manager_command
+
+
+def test_pnlink_python_has_robot_venv_default(monkeypatch):
+    monkeypatch.delenv("SONIC_PNLINK_PYTHON", raising=False)
+
+    assert default_pnlink_python_executable() == (
+        "/opt/bxi/venvs/sonic_pnlink/bin/python"
+    )
+
+
+def test_pnlink_runtime_starts_source_persistently_and_bridge_separately(
+    monkeypatch,
+):
+    processes = [FakeProcess(pid=701), FakeProcess(pid=702)]
+    popen_calls = []
+
+    def fake_popen(command, **kwargs):
+        popen_calls.append((command, kwargs))
+        return processes[len(popen_calls) - 1]
+
+    env = {
+        "SONIC_PNLINK_TOPOLOGY": "local",
+        "SONIC_PNLINK_HOST": "127.0.0.1",
+        "SONIC_PNLINK_PORT": "5556",
+        "SONIC_PNLINK_SDK_PATH": "/opt/vendor/pnlink",
+    }
+    monkeypatch.setattr(runtime_supervisor.subprocess, "Popen", fake_popen)
+    runtime = PnLinkRuntime(FakeLogger(), "/pnlink/python", env)
+
+    runtime.start_persistent()
+
+    assert len(popen_calls) == 1
+    source_command, source_kwargs = popen_calls[0]
+    assert source_command[:3] == [
+        "/pnlink/python",
+        "-m",
+        "bxi_example_py_elf3.sonic_pnlink.pose_source",
+    ]
+    assert source_kwargs["env"]["SONIC_PNLINK_SDK_PATH"] == "/opt/vendor/pnlink"
+    assert runtime.bridge.children == []
+
+    runtime.start_bridge()
+
+    assert len(popen_calls) == 2
+    bridge_command = popen_calls[1][0]
+    assert _option(bridge_command, "--source-kind") == "pnlink"
+    assert _option(bridge_command, "--pose-host") == "127.0.0.1"
+    assert _option(bridge_command, "--pico-port") == "5556"
+    assert "--disable-ros-pico-topics" in bridge_command
+
+
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("SONIC_PNLINK_TOPOLOGY", "remote"),
+        ("SONIC_PNLINK_HOST", "10.0.0.2"),
+        ("SONIC_PNLINK_BIND_HOST", "0.0.0.0"),
+        ("BXI_SONIC_SMPL_REF_ZMQ_HOST", "10.0.0.3"),
+    ],
+)
+def test_pnlink_runtime_rejects_nonlocal_topology(monkeypatch, name, value):
+    env = {
+        "SONIC_PNLINK_TOPOLOGY": "local",
+        "SONIC_PNLINK_HOST": "127.0.0.1",
+        "SONIC_PNLINK_BIND_HOST": "127.0.0.1",
+    }
+    env[name] = value
+
+    with pytest.raises(ValueError):
+        PnLinkRuntime(FakeLogger(), "python3", env)
+
+
+def test_pnlink_optional_viewer_is_started_as_low_priority(monkeypatch):
+    processes = [FakeProcess(pid=711), FakeProcess(pid=712)]
+    popen_calls = []
+
+    def fake_popen(command, **kwargs):
+        popen_calls.append((command, kwargs))
+        return processes[len(popen_calls) - 1]
+
+    env = {
+        "SONIC_PNLINK_DIAGNOSTICS": "1",
+        "SONIC_PNLINK_MUJOCO_VIEWER": "1",
+    }
+    monkeypatch.setattr(runtime_supervisor.subprocess, "Popen", fake_popen)
+    runtime = PnLinkRuntime(FakeLogger(), "/pnlink/python", env)
+
+    runtime.start_persistent()
+
+    assert len(popen_calls) == 2
+    assert popen_calls[1][0][:4] == ["nice", "-n", "10", "/pnlink/python"]
+    assert popen_calls[1][0][-1] == "bxi_example_py_elf3.sonic_pnlink.mujoco_viewer"
+
+
+def test_pnlink_source_exit_stops_bridge_without_restart(monkeypatch):
+    source = FakeProcess(pid=721)
+    bridge = FakeProcess(pid=722)
+    processes = [source, bridge]
+    group_signals = []
+
+    def fake_popen(_command, **_kwargs):
+        return processes.pop(0)
+
+    def fake_killpg(pgid, signum):
+        group_signals.append((pgid, signum))
+
+    monkeypatch.setattr(runtime_supervisor.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(runtime_supervisor.os, "killpg", fake_killpg)
+    runtime = PnLinkRuntime(FakeLogger(), "python3", {})
+    runtime.start_persistent()
+    runtime.start_bridge()
+    source.returncode = 1
+
+    runtime.poll()
+
+    assert runtime.source_failed
+    assert runtime.source.stopping
+    assert runtime.bridge.stopping
+    assert (bridge.pid, signal.SIGINT) in group_signals
+    with pytest.raises(RuntimeError, match="restart is required"):
+        runtime.start_persistent()
+
+
+def test_pnlink_viewer_exit_does_not_stop_source_or_bridge(monkeypatch):
+    source = FakeProcess(pid=731)
+    viewer = FakeProcess(pid=732)
+    bridge = FakeProcess(pid=733)
+    processes = [source, viewer, bridge]
+
+    def fake_popen(_command, **_kwargs):
+        return processes.pop(0)
+
+    def fake_killpg(pgid, signum):
+        if pgid == viewer.pid and signum == 0:
+            raise ProcessLookupError
+
+    env = {
+        "SONIC_PNLINK_DIAGNOSTICS": "1",
+        "SONIC_PNLINK_MUJOCO_VIEWER": "1",
+    }
+    monkeypatch.setattr(runtime_supervisor.subprocess, "Popen", fake_popen)
+    monkeypatch.setattr(runtime_supervisor.os, "killpg", fake_killpg)
+    runtime = PnLinkRuntime(FakeLogger(), "python3", env)
+    runtime.start_persistent()
+    runtime.start_bridge()
+    viewer.returncode = 1
+
+    runtime.poll()
+
+    assert runtime.viewer_failed
+    assert not runtime.source.stopping
+    assert not runtime.bridge.stopping
+    assert runtime.source_failed is False
+
+
+class FakeResponse:
+    def __init__(self, success=True):
+        self.success = success
+
+
+class FakeFuture:
+    def __init__(self, done=False, response=None, error=None):
+        self._done = done
+        self.response = response
+        self.error = error
+
+    def done(self):
+        return self._done
+
+    def result(self):
+        if self.error is not None:
+            raise self.error
+        return self.response
+
+
+def test_pnlink_pause_requires_service_and_ready_paused_status():
+    future = FakeFuture(done=True, response=FakeResponse(success=True))
+    request = PnLinkPauseRequest(started_at=10.0, future=future)
+
+    assert request.evaluate(10.1) is None
+    request.observe_status(
+        json.dumps({"state": "READY_PAUSED", "live_enabled": False})
+    )
+
+    assert request.evaluate(10.1) == "confirmed"
+    assert pnlink_ready_paused("not-json") is False
+
+
+def test_pnlink_pause_fails_closed_on_service_or_status_timeout():
+    pending = PnLinkPauseRequest(
+        started_at=10.0,
+        future=FakeFuture(done=False),
+    )
+    completed = PnLinkPauseRequest(
+        started_at=10.0,
+        future=FakeFuture(done=True, response=FakeResponse(success=True)),
+    )
+
+    assert pending.evaluate(10.201) == "service_timeout"
+    assert completed.evaluate(10.501) == "status_timeout"
+
+
+def test_pnlink_pause_does_not_accept_status_before_service_succeeds():
+    request = PnLinkPauseRequest(
+        started_at=10.0,
+        future=FakeFuture(done=False),
+    )
+    request.observe_status(
+        json.dumps({"state": "READY_PAUSED", "live_enabled": False})
+    )
+
+    assert request.evaluate(10.1) is None
+    assert request.evaluate(10.201) == "service_timeout"
