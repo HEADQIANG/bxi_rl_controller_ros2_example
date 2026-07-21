@@ -38,6 +38,7 @@ from bxi_example_py_elf3.sonic_pnlink.temporal import (
 from bxi_example_py_elf3.sonic_pnlink.retarget import (
     _smpl_global_rotations,
     _smpl_local_axis_angle,
+    smpl_hand_floor_contact,
     wrist_reference,
 )
 from bxi_example_py_elf3.sonic_pnlink import sdk_adapter
@@ -334,6 +335,77 @@ def test_wrist_reference_moves_elbow_swing_into_wrist():
     wrist = wrist_reference(body_pose)
 
     np.testing.assert_allclose(wrist[[0, 4, 5]], [0.3, -0.25, 0.15], atol=1.0e-6)
+
+
+def test_smpl_hand_floor_contact_restores_root_orientation():
+    world_joints = np.zeros((24, 3), dtype=np.float64)
+    world_joints[10, 2] = 0.01
+    world_joints[11, 2] = 0.0
+    world_joints[22, 2] = 0.04
+    world_joints[23, 2] = 0.08
+    root_rotation = Rotation.from_euler("x", 90.0, degrees=True)
+    root_xyzw = root_rotation.as_quat()
+    root_wxyz = root_xyzw[[3, 0, 1, 2]]
+    local_joints = root_rotation.inv().apply(world_joints)
+
+    measurement = smpl_hand_floor_contact(
+        local_joints, root_wxyz, threshold_m=0.05
+    )
+
+    assert np.isclose(measurement.foot_plane_z_m, 0.0)
+    np.testing.assert_allclose(measurement.hand_gap_m, [0.04, 0.08], atol=1.0e-6)
+    np.testing.assert_array_equal(measurement.contact, [True, False])
+
+
+def test_smpl_hand_below_foot_plane_counts_as_contact():
+    joints = np.zeros((24, 3), dtype=np.float32)
+    joints[22, 2] = -0.2
+    joints[23, 2] = 0.2
+
+    measurement = smpl_hand_floor_contact(
+        joints,
+        np.array([1.0, 0.0, 0.0, 0.0]),
+        threshold_m=0.05,
+    )
+
+    np.testing.assert_array_equal(measurement.contact, [True, False])
+
+
+def test_smpl_hand_floor_contact_rejects_invalid_input():
+    joints = np.zeros((24, 3), dtype=np.float32)
+    joints[22, 2] = np.nan
+
+    with np.testing.assert_raises(ValueError):
+        smpl_hand_floor_contact(
+            joints,
+            np.array([1.0, 0.0, 0.0, 0.0]),
+        )
+
+
+def test_debug_wire_carries_smpl_hand_floor_measurement():
+    joints = np.zeros((24, 3), dtype=np.float32)
+    joints[22, 2] = 0.03
+    joints[23, 2] = 0.09
+    result = RetargetResult(
+        tuple(Rotation.identity() for _ in range(24)),
+        np.zeros((22, 3), dtype=np.float32),
+        joints,
+        np.array([1.0, 0.0, 0.0, 0.0], dtype=np.float32),
+        np.zeros(6, dtype=np.float32),
+    )
+
+    snapshot = build_debug_snapshot(
+        frame_index=1,
+        timestamp_monotonic_ns=20_000_000,
+        joints=_identity_local_poses(),
+        result=result,
+    )
+    decoded = decode_debug_frame(pack_debug_frame(snapshot))
+
+    np.testing.assert_allclose(decoded["smpl_hand_floor_gap_m"], [0.03, 0.09])
+    np.testing.assert_array_equal(
+        decoded["smpl_hand_floor_contact"], [True, False]
+    )
 
 
 def test_resampler_interpolates_positions_and_slerps_root_rotation():

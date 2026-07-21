@@ -33,9 +33,11 @@ from .diagnostics import (
     DiagnosticReporter,
 )
 from .retarget import (
+    DEFAULT_HAND_FLOOR_THRESHOLD_M,
     RetargetResult,
     process_smpl_frame,
     retarget_rotations,
+    smpl_hand_floor_contact,
 )
 from .sdk_adapter import (
     CALIBRATE_MOTION,
@@ -178,6 +180,23 @@ class SonicPnLinkPoseSource:
         self.stop_requested = False
         self._last_status_json = ""
         self._last_status_time = 0.0
+        self.hand_floor_threshold_m = float(
+            os.environ.get(
+                "SONIC_PNLINK_HAND_FLOOR_THRESHOLD_M",
+                str(DEFAULT_HAND_FLOOR_THRESHOLD_M),
+            )
+        )
+        if (
+            not np.isfinite(self.hand_floor_threshold_m)
+            or self.hand_floor_threshold_m < 0.0
+        ):
+            raise RuntimeError(
+                "SONIC_PNLINK_HAND_FLOOR_THRESHOLD_M must be finite and non-negative"
+            )
+        self.smpl_foot_plane_z_m = float("nan")
+        self.smpl_hand_floor_gap_m = np.full(2, np.nan, dtype=np.float32)
+        self.smpl_hand_floor_contact = np.zeros(2, dtype=bool)
+        self._previous_hand_floor_contact: np.ndarray | None = None
 
         bind_host = os.environ.get("SONIC_PNLINK_BIND_HOST", "127.0.0.1")
         if bind_host not in ("127.0.0.1", "localhost"):
@@ -242,6 +261,12 @@ class SonicPnLinkPoseSource:
         self.next_frame_index = 0
         self.previous_root_quat = None
 
+    def _clear_hand_floor_contact(self) -> None:
+        self.smpl_foot_plane_z_m = float("nan")
+        self.smpl_hand_floor_gap_m = np.full(2, np.nan, dtype=np.float32)
+        self.smpl_hand_floor_contact = np.zeros(2, dtype=bool)
+        self._previous_hand_floor_contact = None
+
     def start_capture(self) -> tuple[bool, str]:
         with self._lock:
             if self.capture_active:
@@ -281,6 +306,7 @@ class SonicPnLinkPoseSource:
             self.neutral_bone_lengths_cm.clear()
             self.smpl_neutral_lengths_m.clear()
             self._clear_live_buffers()
+            self._clear_hand_floor_contact()
         try:
             self.sdk.calibrate_motion()
         except Exception as exc:
@@ -322,6 +348,7 @@ class SonicPnLinkPoseSource:
                     self.live_enabled = False
                     self.state = SourceState.DISCONNECTED
                     self._clear_live_buffers()
+                    self._clear_hand_floor_contact()
                     self.logger.info(f"PN-Link stop capture: {result.message}")
                 else:
                     self.logger.error(f"PN-Link stop capture failed: {result.message}")
@@ -370,6 +397,7 @@ class SonicPnLinkPoseSource:
             self.neutral_bone_lengths_cm.clear()
             self.smpl_neutral_lengths_m.clear()
             self._clear_live_buffers()
+            self._clear_hand_floor_contact()
             self.neutral_samples = []
             self.neutral_bone_length_samples_cm = []
         self._publish_status(force=True)
@@ -693,6 +721,7 @@ class SonicPnLinkPoseSource:
             return
         self._recover_stage("SMPL_RETARGET", frame_index)
         self._recover_stage("SMPL_FK", frame_index)
+        self._update_hand_floor_contact(result)
         self.previous_raw_poses = dict(frame.joints)
         self._queue_debug(
             frame, world, result, raw_validation, frame_index
@@ -741,8 +770,34 @@ class SonicPnLinkPoseSource:
                 raw_position_valid=raw_validation.position_valid,
                 raw_rotation_valid=raw_validation.rotation_valid,
                 source_stage_valid=np.ones(7, dtype=bool),
+                hand_floor_threshold_m=self.hand_floor_threshold_m,
             )
         )
+
+    def _update_hand_floor_contact(self, result: RetargetResult) -> None:
+        measurement = smpl_hand_floor_contact(
+            result.smpl_joints_local,
+            result.root_quaternion_wxyz,
+            threshold_m=self.hand_floor_threshold_m,
+        )
+        with self._lock:
+            previous = self._previous_hand_floor_contact
+            self.smpl_foot_plane_z_m = measurement.foot_plane_z_m
+            self.smpl_hand_floor_gap_m = measurement.hand_gap_m.copy()
+            self.smpl_hand_floor_contact = measurement.contact.copy()
+            changed = previous is None or not np.array_equal(
+                previous, measurement.contact
+            )
+            self._previous_hand_floor_contact = measurement.contact.copy()
+        if changed:
+            self.logger.info(
+                "SMPL hand-floor "
+                f"left={bool(measurement.contact[0])} "
+                f"gap={measurement.hand_gap_m[0]:+.3f}m, "
+                f"right={bool(measurement.contact[1])} "
+                f"gap={measurement.hand_gap_m[1]:+.3f}m, "
+                f"threshold={self.hand_floor_threshold_m:.3f}m"
+            )
 
     def _tick(self) -> None:
         self.sdk.poll()
@@ -837,6 +892,17 @@ class SonicPnLinkPoseSource:
             "countdown_seconds": countdown_seconds,
             "neutral_samples_collected": neutral_samples_collected,
             "neutral_samples_required": NEUTRAL_SAMPLE_COUNT,
+            "smpl_foot_plane_z_m": (
+                round(self.smpl_foot_plane_z_m, 4)
+                if np.isfinite(self.smpl_foot_plane_z_m)
+                else None
+            ),
+            "smpl_hand_floor_gap_m": [
+                round(float(value), 4) if np.isfinite(value) else None
+                for value in self.smpl_hand_floor_gap_m
+            ],
+            "smpl_hand_floor_contact": self.smpl_hand_floor_contact.tolist(),
+            "smpl_hand_floor_threshold_m": self.hand_floor_threshold_m,
         }
 
     def _publish_status(self, *, force: bool = False) -> None:

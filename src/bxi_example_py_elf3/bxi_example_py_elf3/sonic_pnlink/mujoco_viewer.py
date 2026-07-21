@@ -438,6 +438,24 @@ def _overlay(
                 f"hz={status.get('source_hz', '?')} live={status.get('live_enabled', '?')}",
             )
         )
+        hand_gap = np.asarray(
+            frame.get("smpl_hand_floor_gap_m", np.full(2, np.nan)),
+            dtype=np.float64,
+        ).reshape(2)
+        hand_contact = np.asarray(
+            frame.get("smpl_hand_floor_contact", np.zeros(2, dtype=bool)),
+            dtype=bool,
+        ).reshape(2)
+        if np.all(np.isfinite(hand_gap)):
+            rows.append(
+                (
+                    "SMPL hand-floor",
+                    f"L={hand_gap[0]:+.3f}m "
+                    f"{'CONTACT' if hand_contact[0] else 'clear'} | "
+                    f"R={hand_gap[1]:+.3f}m "
+                    f"{'CONTACT' if hand_contact[1] else 'clear'}",
+                )
+            )
         source_name = SMPL_TO_PNLINK[state.selected_smpl_joint]
         if source_name in PNLINK_JOINT_NAMES:
             source_index = PNLINK_JOINT_NAMES.index(source_name)

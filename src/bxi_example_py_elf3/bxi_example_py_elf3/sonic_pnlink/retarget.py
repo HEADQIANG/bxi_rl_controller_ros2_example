@@ -13,6 +13,11 @@ from scipy.spatial.transform import Rotation
 from .skeleton import PNLINK_TO_ROBOT, SMPL_PARENTS, SMPL_TO_PNLINK, rotation_from_wxyz
 
 
+DEFAULT_HAND_FLOOR_THRESHOLD_M = 0.05
+SMPL_FOOT_INDICES = np.asarray([10, 11], dtype=np.int64)
+SMPL_HAND_INDICES = np.asarray([22, 23], dtype=np.int64)
+
+
 @dataclass(frozen=True)
 class RetargetResult:
     smpl_global: tuple[Rotation, ...]
@@ -20,6 +25,41 @@ class RetargetResult:
     smpl_joints_local: np.ndarray
     root_quaternion_wxyz: np.ndarray
     wrist: np.ndarray
+
+
+@dataclass(frozen=True)
+class HandFloorContact:
+    foot_plane_z_m: float
+    hand_gap_m: np.ndarray
+    contact: np.ndarray
+
+
+def smpl_hand_floor_contact(
+    smpl_joints_local: np.ndarray,
+    root_quaternion_wxyz: np.ndarray,
+    *,
+    threshold_m: float = DEFAULT_HAND_FLOOR_THRESHOLD_M,
+) -> HandFloorContact:
+    """Measure each SMPL hand against the lower foot point in robot Z-up."""
+    joints = np.asarray(smpl_joints_local, dtype=np.float64)
+    root = np.asarray(root_quaternion_wxyz, dtype=np.float64)
+    threshold = float(threshold_m)
+    if joints.shape != (24, 3) or not np.all(np.isfinite(joints)):
+        raise ValueError("SMPL hand-floor check requires finite joints [24,3]")
+    if root.shape != (4,) or not np.all(np.isfinite(root)):
+        raise ValueError("SMPL hand-floor check requires a finite root quaternion [4]")
+    if not np.isfinite(threshold) or threshold < 0.0:
+        raise ValueError("SMPL hand-floor threshold must be finite and non-negative")
+
+    world_oriented = rotation_from_wxyz(root).apply(joints)
+    foot_plane_z = float(np.min(world_oriented[SMPL_FOOT_INDICES, 2]))
+    gaps = world_oriented[SMPL_HAND_INDICES, 2] - foot_plane_z
+    contacts = gaps <= threshold
+    return HandFloorContact(
+        foot_plane_z,
+        np.asarray(gaps, dtype=np.float32),
+        np.asarray(contacts, dtype=bool),
+    )
 
 
 def _smpl_global_rotations(

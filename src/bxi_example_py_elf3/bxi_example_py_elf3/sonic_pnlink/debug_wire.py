@@ -13,6 +13,7 @@ except ImportError:  # pragma: no cover - wire tests do not need a socket
 
 from bxi_example_py_elf3.sonic_pico.zmq_messages import pack_pose_message
 
+from .retarget import DEFAULT_HAND_FLOOR_THRESHOLD_M, smpl_hand_floor_contact
 from .skeleton import PNLINK_JOINT_NAMES, rotation_to_wxyz
 
 
@@ -76,6 +77,7 @@ def build_debug_snapshot(
     raw_position_valid: np.ndarray | None = None,
     raw_rotation_valid: np.ndarray | None = None,
     source_stage_valid: np.ndarray | None = None,
+    hand_floor_threshold_m: float = DEFAULT_HAND_FLOOR_THRESHOLD_M,
 ) -> dict[str, np.ndarray]:
     joint_count = len(PNLINK_JOINT_NAMES)
     local_pos = np.full((joint_count, 3), np.nan, dtype=np.float32)
@@ -111,6 +113,8 @@ def build_debug_snapshot(
     smpl_joints = np.full((24, 3), np.nan, dtype=np.float32)
     root_quat = np.full(4, np.nan, dtype=np.float32)
     wrist = np.full(6, np.nan, dtype=np.float32)
+    hand_floor_gap = np.full(2, np.nan, dtype=np.float32)
+    hand_floor_contact = np.zeros(2, dtype=bool)
     if result is not None:
         retarget_quat = np.stack(
             [rotation_to_wxyz(value) for value in result.smpl_global]
@@ -125,6 +129,17 @@ def build_debug_snapshot(
             result.root_quaternion_wxyz, dtype=np.float32
         ).reshape(4)
         wrist = np.asarray(result.wrist, dtype=np.float32).reshape(6)
+        try:
+            measurement = smpl_hand_floor_contact(
+                smpl_joints,
+                root_quat,
+                threshold_m=hand_floor_threshold_m,
+            )
+        except (TypeError, ValueError):
+            pass
+        else:
+            hand_floor_gap = measurement.hand_gap_m
+            hand_floor_contact = measurement.contact
 
     present = (
         np.asarray(raw_present, dtype=bool).reshape(joint_count)
@@ -155,6 +170,8 @@ def build_debug_snapshot(
         "smpl_joints": smpl_joints,
         "smpl_root_quat": root_quat,
         "wrist": wrist,
+        "smpl_hand_floor_gap_m": hand_floor_gap,
+        "smpl_hand_floor_contact": hand_floor_contact,
         "raw_present": present,
         "raw_position_valid": position_valid,
         "raw_rotation_valid": rotation_valid,

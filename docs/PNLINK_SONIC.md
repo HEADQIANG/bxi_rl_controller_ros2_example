@@ -671,6 +671,8 @@ debug frame 是单个源帧在各处理阶段的只读快照，不复用 10 帧 
 | `smpl_joints` | `float32` | `[24,3]` | 最终根坐标系 SMPL 骨架 |
 | `smpl_root_quat` | `float32` | `[4]` | 最终 SONIC 根旋转 |
 | `wrist` | `float32` | `[6]` | 最终 ELF3 wrist 参考 |
+| `smpl_hand_floor_gap_m` | `float32` | `[2]` | 左右手高于脚底平面的距离，米 |
+| `smpl_hand_floor_contact` | `bool` | `[2]` | 左右手是否到达脚底平面 |
 | `raw_present` | `bool` | `[J]` | 原始关节是否存在 |
 | `raw_position_valid` | `bool` | `[J]` | 原始/FK 位置是否有效 |
 | `raw_rotation_valid` | `bool` | `[J]` | 原始/FK 旋转是否有效 |
@@ -684,6 +686,13 @@ debug frame 是单个源帧在各处理阶段的只读快照，不复用 10 帧 
 值，并以错误颜色标记，原始非法值只写入诊断 bundle。
 
 debug frame 只用于观察，不作为 pose、bridge 或 policy 的输入，防止诊断功能改变控制链。
+
+手-脚底判定先用 `smpl_root_quat` 将根坐标系关节旋回机器人 Z-up
+朝向，以 `left_foot/right_foot` 中较低的 Z 值作为脚底平面。左右手与该
+平面的高度差不大于阈值时记为到达；负高度差表示手已低于脚底平面，也
+记为到达。默认阈值为 `0.05 m`，可通过
+`SONIC_PNLINK_HAND_FLOOR_THRESHOLD_M` 调整。该计算只比较手脚相对高度，不需要根
+平移，不会修改 `pose` 或 SONIC 动作。
 
 ### 8.3 同场景双骨架布局
 

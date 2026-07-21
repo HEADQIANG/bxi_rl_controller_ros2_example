@@ -271,7 +271,8 @@ class DiagnosticBundleRecorder:
                 capture.frames,
                 (
                     "frame_index", "timestamp_", "smpl_joints",
-                    "smpl_root_", "wrist", "source_stage_",
+                    "smpl_root_", "smpl_hand_", "wrist",
+                    "source_stage_",
                 ),
             ),
         }
